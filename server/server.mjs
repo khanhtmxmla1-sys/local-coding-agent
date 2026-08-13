@@ -26,7 +26,7 @@ import { fileURLToPath } from "node:url";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { z } from "zod";
-import { AgentManager, ROLES, detectProviders, AGENT_ID_RE } from "./agent-manager.mjs";
+import { AgentManager, ROLES, detectProviders, isTaskHubManagedRole, AGENT_ID_RE } from "./agent-manager.mjs";
 import { BrowserBridge, BROWSER_COMMAND_ID_RE, CHROME_EXTENSION_ORIGIN_RE } from "./browser-bridge.mjs";
 import {
   PermissionResolver,
@@ -48,6 +48,9 @@ import {
 import { ContextMemory, contextPressure } from "./context-memory.mjs";
 import { TaskHubStore } from "./task-hub/store.mjs";
 import { registerTaskHubTools } from "./task-hub/tools.mjs";
+import { ProjectRegistry } from "./task-hub/project-registry.mjs";
+import { TaskHubDispatcher } from "./task-hub/worker-dispatcher.mjs";
+import { registerTaskHubWorkerTools } from "./task-hub/worker-tools.mjs";
 
 // ----------------------------------------------------------------------------
 // Configuration (all overridable via environment variables)
@@ -192,6 +195,12 @@ if (ROOTS.some((root) => isPathInside(canonicalizePath(TASK_HUB_DIR), canonicali
   throw new Error("Task Hub storage must be outside every authorized workspace root. Set AGENT_TASK_HUB_DIR to a private operator-owned path.");
 }
 const TASK_HUB_STORE = new TaskHubStore({ dir: TASK_HUB_DIR });
+const TASK_HUB_PROJECTS_DIR = path.resolve(process.env.AGENT_TASK_HUB_PROJECTS_DIR || path.join(PRIVATE_STATE_DIR, "task-hub-projects"));
+if (ROOTS.some((root) => isPathInside(canonicalizePath(TASK_HUB_PROJECTS_DIR), canonicalizePath(root)))) {
+  throw new Error("Task Hub project registry must be outside every authorized workspace root. Set AGENT_TASK_HUB_PROJECTS_DIR to a private operator-owned path.");
+}
+const TASK_HUB_PROJECT_REGISTRY = new ProjectRegistry({ dir: TASK_HUB_PROJECTS_DIR });
+let TASK_HUB_DISPATCHER = null;
 
 // v2.6 Policy
 const AGENT_POLICY = (() => {
@@ -329,6 +338,43 @@ if (PREVIEW_ENABLED) {
     policy: AGENT_POLICY
   });
   await agentManager.init();
+  TASK_HUB_DISPATCHER = new TaskHubDispatcher({
+    store: TASK_HUB_STORE,
+    registry: TASK_HUB_PROJECT_REGISTRY,
+    agentManager,
+    resolveWorkspace: resolveTaskHubDispatchWorkspace,
+    providerAvailable: (name) => detectProviders().some((provider) => provider.name === name && provider.available),
+    maxRuntimeMs: boundedNumber(process.env.AGENT_TASK_HUB_WORKER_MAX_RUNTIME_MS, 300000, 1000, 600000),
+    leaseMs: boundedNumber(process.env.AGENT_TASK_HUB_WORKER_LEASE_MS, 360000, 2000, 3600000)
+  });
+}
+
+function resolveTaskHubRegistrationWorkspace(workspaceRoot) {
+  const decision = PERMISSION_RESOLVER.explain(workspaceRoot, "read");
+  if (!decision.allowed) {
+    throw new Error(`Project workspace is not readable in the active permission profile [${decision.reason}].`);
+  }
+  return { resolved: decision.resolved };
+}
+
+async function resolveTaskHubDispatchWorkspace(project, task) {
+  const capability = task.role === "CODING" ? "write" : "read";
+  const decision = PERMISSION_RESOLVER.explain(project.workspace_root, capability);
+  if (!decision.allowed) {
+    throw new Error(`Project ${project.id} workspace is not allowed for ${capability} [${decision.reason}].`);
+  }
+  const root = decision.root;
+  const hasDenyRules = Array.isArray(root?.deny) && root.deny.length > 0;
+  if (task.role === "CODING" && root?.filesystem !== "write") {
+    throw new Error(`Project ${project.id} cannot use the coding adapter because its permission root is not writable.`);
+  }
+  return {
+    resolved: decision.resolved,
+    can_write: task.role === "CODING",
+    has_deny_rules: hasDenyRules,
+    permission_profile: PERMISSION_RESOLVER.summary().name,
+    permission_roots: root ? [{ path: project.workspace_root, preset: root.preset, filesystem: root.filesystem, commands: root.commands }] : []
+  };
 }
 
 let metrics = loadMetrics();
@@ -574,7 +620,7 @@ const SERVER_INSTRUCTIONS = [
   "Anti-lag workflow: do not paste full logs, full diffs, base64 blobs, image/icon inventories, or repeated single-file reads into chat. Save detailed output to local files or reports, then return a compact summary with paths and next actions.",
   "Prefer targeted line ranges, globs, read_many with max_chars, and run_command/run_commands with max_output_chars so long ChatGPT Web threads stay responsive.",
   "ChatGPT Web compact workflow: when the conversation grows long or feels slow, call context_status. If it recommends compacting, call compact_context with only established facts, decisions, constraints, completed work, open tasks, and the next action. Never include credentials or full source/log content. Then tell the user to open a NEW chat; in that fresh chat call resume_context FIRST and verify workspace_info/git_status before editing.",
-  "AI Task Hub orchestration: task_hub_create always starts DRAFT. Advance lifecycle with task_hub_transition using expected_version; approval-bearing gates require one exact local approval. A worker may enter RUNNING only through task_hub_claim, must heartbeat with its lease_id, and must finish through task_hub_submit_result. Treat lease_id as a secret credential and never copy it into notes, reports, or chat summaries.",
+  "AI Task Hub orchestration: task_hub_create always starts DRAFT. Register each project once with task_hub_project_register (exact local approval), advance the task to READY, then use task_hub_dispatch for supported real workers. CODING and REVIEWER use the registered project workspace; BROWSER fails closed until a browser-capable worker exists. Manual workers may still use claim/heartbeat/submit_result. Never copy lease credentials into notes, reports, or chat summaries.",
   "If a task matches an available skill, call list_skills first, then read_skill(name) to load its instructions before doing the work.",
   "Prefer a few large, well-targeted calls over many tiny ones.",
   ...(PREVIEW_ENABLED
@@ -606,6 +652,14 @@ function createMcpServer() {
   registerPlannerTools(mcp);      // v2.5
   registerPolicyTools(mcp);       // v2.6
   registerTaskHubTools(mcp, { reg, store: TASK_HUB_STORE, jsonResult, authorizeAction: consumeExactApproval });
+  registerTaskHubWorkerTools(mcp, {
+    reg,
+    jsonResult,
+    registry: TASK_HUB_PROJECT_REGISTRY,
+    dispatcher: TASK_HUB_DISPATCHER,
+    authorizeAction: consumeExactApproval,
+    resolveRegistrationWorkspace: resolveTaskHubRegistrationWorkspace
+  });
   registerProfileTools(mcp);      // v2.8
   if (PREVIEW_ENABLED) registerPermissionTools(mcp); // v5 official feature set
   if (PREVIEW_ENABLED) registerSystemPowerTools(mcp); // v5 official, separately opt-in
@@ -6227,7 +6281,7 @@ const STRICT_MUTATION_TOOLS = new Set([
   "save_note", "compact_context", "checkpoint", "write_file", "replace_in_file", "apply_patch", "make_dir", "move_path", "delete_path",
   "run_command", "run_commands", "proc_start", "proc_stop", "git", "create_skill", "delete_skill", "undo_last_patch",
   "quality_gate", "run_tests", "run_build", "run_lint", "run_changed_tests", "task_plan", "task_state", "decision_log",
-  "task_hub_create", "task_hub_transition", "task_hub_claim", "task_hub_heartbeat", "task_hub_submit_result",
+  "task_hub_create", "task_hub_transition", "task_hub_claim", "task_hub_heartbeat", "task_hub_submit_result", "task_hub_project_register", "task_hub_dispatch",
   "browser_navigate", "browser_click", "browser_type", "browser_tab_action", "browser_press", "browser_select",
   "schedule_system_shutdown"
 ]);
@@ -7365,8 +7419,14 @@ function registerPreviewTools(mcp) {
   // ChatGPT Web does NOT run native sub-agents. It calls these tools; the server
   // runs and tracks sub-agent tasks locally and returns compact summaries.
   // --------------------------------------------------------------------------
-  const ROLE_NAMES = Object.keys(ROLES);
+  const ROLE_NAMES = Object.keys(ROLES).filter((name) => !isTaskHubManagedRole(name));
   const agentsHint = "Full output stays local; use get_local_task_result (compact) or the dashboard Local tasks panel.";
+  const publicLocalTaskMeta = (taskId) => {
+    const meta = agentManager.get(taskId);
+    if (!meta) throw new Error(`No local task with id ${taskId}. Use list_local_tasks.`);
+    if (isTaskHubManagedRole(meta.role)) throw new Error(`Local task ${taskId} is managed by Task Hub. Use task_hub_worker_status instead.`);
+    return meta;
+  };
   // Neutral tool names + descriptions: these tools record a LOCAL task and run a
   // deterministic local planner. They do not execute shell commands, spawn OS
   // processes, or access the network. Kept benign so strict MCP clients don't
@@ -7453,7 +7513,7 @@ function registerPreviewTools(mcp) {
       }
     },
     async ({ status, limit = 20 }) => {
-      const agents = agentManager.list({ status, limit });
+      const agents = agentManager.list({ status, limit: 200 }).filter((meta) => !isTaskHubManagedRole(meta.role)).slice(0, limit);
       return jsonResult({ count: agents.length, dashboard_url: dashboardUrl, tasks: agents });
     }
   );
@@ -7468,8 +7528,7 @@ function registerPreviewTools(mcp) {
     },
     async ({ task_id }) => {
       const agent_id = task_id;
-      const meta = agentManager.get(agent_id);
-      if (!meta) throw new Error(`No local task with id ${agent_id}. Use list_local_tasks.`);
+      const meta = publicLocalTaskMeta(agent_id);
       return jsonResult({
         task_id: meta.agent_id,
         role: meta.role,
@@ -7502,6 +7561,7 @@ function registerPreviewTools(mcp) {
       }
     },
     async ({ task_id, max_chars = 2000 }) => {
+      publicLocalTaskMeta(task_id);
       const res = await agentManager.result(task_id, max_chars);
       return jsonResult({
         task_id: res.agent_id,
@@ -7527,6 +7587,7 @@ function registerPreviewTools(mcp) {
       inputSchema: { task_id: z.string().regex(AGENT_ID_RE, "Invalid task id.") }
     },
     async ({ task_id }) => {
+      publicLocalTaskMeta(task_id);
       const res = await agentManager.cancel(task_id);
       return jsonResult({ task_id: res.agent_id, status: res.status, message: res.message });
     }

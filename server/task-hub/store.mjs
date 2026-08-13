@@ -239,6 +239,52 @@ export class TaskHubStore {
     });
   }
 
+  async releaseClaim(taskId, workerId, leaseId) {
+    workerId = assertWorkerId(workerId);
+    if (typeof leaseId !== "string" || !leaseId) throw new Error("lease id is required.");
+    return this.withWriteLock(async () => {
+      const task = await this.readTaskUnlocked(taskId);
+      if (!task) throw new Error(`Task ${taskId} not found.`);
+      const now = Number(this.now());
+      const proofMatches = task.lease_proof === await leaseProof(leaseId);
+      if (task.status !== TASK_STATUSES.RUNNING || task.lease_owner !== workerId || !proofMatches) {
+        throw new Error(`Lease for task ${taskId} does not match this worker.`);
+      }
+      task.status = TASK_STATUSES.READY;
+      task.lease_owner = null;
+      task.lease_proof = null;
+      task.lease_expires_at = null;
+      task.updated_at = now;
+      task.version = Number(task.version || 0) + 1;
+      await this.writeTaskUnlocked(task);
+      return clone(task);
+    });
+  }
+
+  async blockClaim(taskId, workerId, leaseId, reason) {
+    workerId = assertWorkerId(workerId);
+    if (typeof leaseId !== "string" || !leaseId) throw new Error("lease id is required.");
+    if (typeof reason !== "string" || !reason.trim() || reason.trim().length > 2000) throw new Error("reason must be a non-empty string up to 2000 characters.");
+    return this.withWriteLock(async () => {
+      const task = await this.readTaskUnlocked(taskId);
+      if (!task) throw new Error(`Task ${taskId} not found.`);
+      const now = Number(this.now());
+      const proofMatches = task.lease_proof === await leaseProof(leaseId);
+      if (task.status !== TASK_STATUSES.RUNNING || task.lease_owner !== workerId || !proofMatches) {
+        throw new Error(`Lease for task ${taskId} does not match this worker.`);
+      }
+      task.status = TASK_STATUSES.BLOCKED;
+      task.blocked_reason = reason.trim();
+      task.lease_owner = null;
+      task.lease_proof = null;
+      task.lease_expires_at = null;
+      task.updated_at = now;
+      task.version = Number(task.version || 0) + 1;
+      await this.writeTaskUnlocked(task);
+      return clone(task);
+    });
+  }
+
   async transitionTask(taskId, to, { expectedVersion, blockedReason = null } = {}) {
     return this.withWriteLock(async () => {
       const task = await this.readTaskUnlocked(taskId);
