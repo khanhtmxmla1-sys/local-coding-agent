@@ -22,7 +22,8 @@
     "test:system-power": "node --test system-power.test.mjs system-power-mcp.test.mjs",
     "test:browser-preview": "node test-browser-preview.mjs",
     "test:context": "node --test context-memory.test.mjs",
-    "eval": "node ../evals/run.mjs"
+    "eval": "node ../evals/run.mjs",
+    "test:task-hub": "node --test task-hub/task-hub.test.mjs task-hub/lease-proof.test.mjs"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.20.0",
