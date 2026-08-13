@@ -189,6 +189,20 @@ test("idFactory is reserved for lease ids, not persistence temp files", async ()
   }
 });
 
+test("store rejects missing parent task", async () => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), "lca-task-hub-"));
+  try {
+    const store = new TaskHubStore({ dir, now: () => NOW });
+    await assert.rejects(
+      () => store.createTask(baseTask({ id: "child-task", parent_id: "missing-parent", status: "DRAFT" })),
+      /parent.*not found|missing parent/i
+    );
+    assert.equal(await store.getTask("child-task"), null);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test("store rejects missing dependencies", async () => {
   const dir = await mkdtemp(path.join(os.tmpdir(), "lca-task-hub-"));
   try {
