@@ -46,6 +46,8 @@ import {
   cancelWindowsShutdown
 } from "./system-power.mjs";
 import { ContextMemory, contextPressure } from "./context-memory.mjs";
+import { TaskHubStore } from "./task-hub/store.mjs";
+import { registerTaskHubTools } from "./task-hub/tools.mjs";
 
 // ----------------------------------------------------------------------------
 // Configuration (all overridable via environment variables)
@@ -181,6 +183,15 @@ if (ROOTS.some((root) => isPathInside(canonicalizePath(APPROVALS_DIR), canonical
 }
 const APPROVAL_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const APPROVAL_TTL_MINUTES = boundedNumber(process.env.AGENT_APPROVAL_TTL_MINUTES, 10, 1, 30);
+
+// AI Task Hub authority-bearing orchestration state lives outside every
+// authorized workspace root so file-writing agents cannot forge task status,
+// permissions, or lease proofs by editing Task Hub JSON directly.
+const TASK_HUB_DIR = path.resolve(process.env.AGENT_TASK_HUB_DIR || path.join(PRIVATE_STATE_DIR, "task-hub", WORKSPACE_ID));
+if (ROOTS.some((root) => isPathInside(canonicalizePath(TASK_HUB_DIR), canonicalizePath(root)))) {
+  throw new Error("Task Hub storage must be outside every authorized workspace root. Set AGENT_TASK_HUB_DIR to a private operator-owned path.");
+}
+const TASK_HUB_STORE = new TaskHubStore({ dir: TASK_HUB_DIR });
 
 // v2.6 Policy
 const AGENT_POLICY = (() => {
@@ -563,6 +574,7 @@ const SERVER_INSTRUCTIONS = [
   "Anti-lag workflow: do not paste full logs, full diffs, base64 blobs, image/icon inventories, or repeated single-file reads into chat. Save detailed output to local files or reports, then return a compact summary with paths and next actions.",
   "Prefer targeted line ranges, globs, read_many with max_chars, and run_command/run_commands with max_output_chars so long ChatGPT Web threads stay responsive.",
   "ChatGPT Web compact workflow: when the conversation grows long or feels slow, call context_status. If it recommends compacting, call compact_context with only established facts, decisions, constraints, completed work, open tasks, and the next action. Never include credentials or full source/log content. Then tell the user to open a NEW chat; in that fresh chat call resume_context FIRST and verify workspace_info/git_status before editing.",
+  "AI Task Hub orchestration: task_hub_create always starts DRAFT. Advance lifecycle with task_hub_transition using expected_version; approval-bearing gates require one exact local approval. A worker may enter RUNNING only through task_hub_claim, must heartbeat with its lease_id, and must finish through task_hub_submit_result. Treat lease_id as a secret credential and never copy it into notes, reports, or chat summaries.",
   "If a task matches an available skill, call list_skills first, then read_skill(name) to load its instructions before doing the work.",
   "Prefer a few large, well-targeted calls over many tiny ones.",
   ...(PREVIEW_ENABLED
@@ -593,6 +605,7 @@ function createMcpServer() {
   registerReviewTools(mcp);       // v2.4
   registerPlannerTools(mcp);      // v2.5
   registerPolicyTools(mcp);       // v2.6
+  registerTaskHubTools(mcp, { reg, store: TASK_HUB_STORE, jsonResult, authorizeAction: consumeExactApproval });
   registerProfileTools(mcp);      // v2.8
   if (PREVIEW_ENABLED) registerPermissionTools(mcp); // v5 official feature set
   if (PREVIEW_ENABLED) registerSystemPowerTools(mcp); // v5 official, separately opt-in
@@ -2942,7 +2955,7 @@ function trimOutput(s, { tail_lines, head_lines, max_chars }) {
 
 // Fields whose values may carry secrets or large payloads — redact them in the
 // audit log so data/audit.log never stores tokens/keys/file contents/commands.
-const AUDIT_REDACT = /^(content|body|diff|patch|old_text|new_text|command|value|token|approval_token|mcp_auth_token|control_plane_api_key|key|secret|password|authorization|auth|api[_-]?key|goal|summary|decisions|constraints|completed|open_tasks|next_steps|next_action)$/i;
+const AUDIT_REDACT = /^(content|body|diff|patch|old_text|new_text|command|value|token|approval_token|lease_id|mcp_auth_token|control_plane_api_key|key|secret|password|authorization|auth|api[_-]?key|goal|summary|result_summary|blocked_reason|decisions|constraints|completed|open_tasks|next_steps|next_action)$/i;
 
 // Recursively redact sensitive keys at ANY depth (e.g. apply_patch.operations[].content,
 // .edits[].new_text) and truncate long strings, so data/audit.log never stores secrets.
@@ -6214,6 +6227,7 @@ const STRICT_MUTATION_TOOLS = new Set([
   "save_note", "compact_context", "checkpoint", "write_file", "replace_in_file", "apply_patch", "make_dir", "move_path", "delete_path",
   "run_command", "run_commands", "proc_start", "proc_stop", "git", "create_skill", "delete_skill", "undo_last_patch",
   "quality_gate", "run_tests", "run_build", "run_lint", "run_changed_tests", "task_plan", "task_state", "decision_log",
+  "task_hub_create", "task_hub_transition", "task_hub_claim", "task_hub_heartbeat", "task_hub_submit_result",
   "browser_navigate", "browser_click", "browser_type", "browser_tab_action", "browser_press", "browser_select",
   "schedule_system_shutdown"
 ]);

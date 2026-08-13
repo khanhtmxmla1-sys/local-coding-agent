@@ -8,6 +8,7 @@ import { randomUUID } from "node:crypto";
 import {
   TASK_STATUSES,
   assertTaskId,
+  canTransition,
   createTaskRecord,
   dependenciesSatisfied,
   hasHighImpactPermission
@@ -144,6 +145,9 @@ export class TaskHubStore {
     return this.withWriteLock(async () => {
       const record = createTaskRecord(input, { now: this.now() });
       if (await this.readTaskUnlocked(record.id)) throw new Error(`Task ${record.id} already exists.`);
+      if (record.parent_id && !(await this.readTaskUnlocked(record.parent_id))) {
+        throw new Error(`Missing parent ${record.parent_id}: task not found.`);
+      }
       for (const dependencyId of record.depends_on) {
         if (!(await this.readTaskUnlocked(dependencyId))) throw new Error(`Missing dependency ${dependencyId}: task not found.`);
       }
@@ -228,6 +232,66 @@ export class TaskHubStore {
         throw new Error(`Lease for task ${taskId} is missing, expired, or does not match this worker.`);
       }
       task.lease_expires_at = now + leaseMs;
+      task.updated_at = now;
+      task.version = Number(task.version || 0) + 1;
+      await this.writeTaskUnlocked(task);
+      return clone(task);
+    });
+  }
+
+  async transitionTask(taskId, to, { expectedVersion, blockedReason = null } = {}) {
+    return this.withWriteLock(async () => {
+      const task = await this.readTaskUnlocked(taskId);
+      if (!task) throw new Error(`Task ${taskId} not found.`);
+      if (!Number.isInteger(expectedVersion) || expectedVersion < 1) throw new Error("expectedVersion must be a positive integer.");
+      if (Number(task.version) !== expectedVersion) throw new Error(`Task ${taskId} version conflict: expected ${expectedVersion}, current ${task.version}.`);
+      if (to === TASK_STATUSES.RUNNING) {
+        throw new Error(`Task ${taskId} must enter RUNNING through claimTask so the worker receives an active lease.`);
+      }
+      if (task.status === TASK_STATUSES.RUNNING) {
+        throw new Error(`Task ${taskId} is RUNNING; use task_hub_submit_result with the active lease instead of a generic transition.`);
+      }
+      if (!canTransition(task.status, to)) throw new Error(`Invalid task transition: ${task.status} -> ${to}.`);
+      if (blockedReason != null && (typeof blockedReason !== "string" || blockedReason.length > 2000)) {
+        throw new Error("blockedReason must be a string up to 2000 characters.");
+      }
+      const now = Number(this.now());
+      if (!Number.isFinite(now)) throw new Error("TaskHubStore clock returned an invalid value.");
+      task.status = to;
+      task.blocked_reason = to === TASK_STATUSES.BLOCKED ? String(blockedReason || "").trim() || null : null;
+      task.updated_at = now;
+      task.version = Number(task.version || 0) + 1;
+      await this.writeTaskUnlocked(task);
+      return clone(task);
+    });
+  }
+
+  async submitResult(taskId, workerId, leaseId, resultSummary, { expectedVersion } = {}) {
+    workerId = assertWorkerId(workerId);
+    if (typeof leaseId !== "string" || !leaseId) throw new Error("lease id is required.");
+    if (typeof resultSummary !== "string" || !resultSummary.trim() || resultSummary.trim().length > 8000) {
+      throw new Error("resultSummary must be a non-empty string up to 8000 characters.");
+    }
+    return this.withWriteLock(async () => {
+      const task = await this.readTaskUnlocked(taskId);
+      if (!task) throw new Error(`Task ${taskId} not found.`);
+      if (expectedVersion != null) {
+        if (!Number.isInteger(expectedVersion) || expectedVersion < 1) throw new Error("expectedVersion must be a positive integer.");
+        if (Number(task.version) !== expectedVersion) throw new Error(`Task ${taskId} version conflict: expected ${expectedVersion}, current ${task.version}.`);
+      }
+      const now = Number(this.now());
+      const active = task.status === TASK_STATUSES.RUNNING && Number(task.lease_expires_at || 0) > now;
+      const proofMatches = task.lease_proof === await leaseProof(leaseId);
+      if (!active || task.lease_owner !== workerId || !proofMatches) {
+        throw new Error(`Lease for task ${taskId} is missing, expired, or does not match this worker.`);
+      }
+      if (!canTransition(task.status, TASK_STATUSES.REVIEW)) throw new Error(`Task ${taskId} cannot move from ${task.status} to REVIEW.`);
+      task.status = TASK_STATUSES.REVIEW;
+      task.result_summary = resultSummary.trim();
+      task.blocked_reason = null;
+      task.lease_owner = null;
+      task.lease_proof = null;
+      task.lease_expires_at = null;
       task.updated_at = now;
       task.version = Number(task.version || 0) + 1;
       await this.writeTaskUnlocked(task);
