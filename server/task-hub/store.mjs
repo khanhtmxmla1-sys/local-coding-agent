@@ -1,7 +1,7 @@
 // Local Coding Agent - AI Task Hub durable store
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-import { mkdir, readFile, readdir, rename, writeFile } from "node:fs/promises";
+import { mkdir, open, readFile, readdir, rename, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
 
@@ -15,6 +15,47 @@ import {
 import { leaseProof } from "./lease-proof.mjs";
 
 const STORE_LOCKS = new Map();
+const FILE_LOCK_RETRY_MS = 15;
+const FILE_LOCK_TIMEOUT_MS = 10_000;
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function acquireFileLock(lockPath) {
+  const startedAt = Date.now();
+
+  while (true) {
+    const token = randomUUID();
+    try {
+      const handle = await open(lockPath, "wx", 0o600);
+      try {
+        await handle.writeFile(JSON.stringify({ token, pid: process.pid, created_at: Date.now() }), "utf8");
+      } catch (error) {
+        await rm(lockPath, { force: true });
+        throw error;
+      } finally {
+        await handle.close();
+      }
+
+      return async () => {
+        try {
+          const current = JSON.parse(await readFile(lockPath, "utf8"));
+          if (current?.token === token) await rm(lockPath, { force: true });
+        } catch (error) {
+          if (error?.code !== "ENOENT") throw error;
+        }
+      };
+    } catch (error) {
+      if (error?.code !== "EEXIST") throw error;
+
+      if (Date.now() - startedAt >= FILE_LOCK_TIMEOUT_MS) {
+        throw new Error("Task Hub store lock timed out.");
+      }
+      await sleep(FILE_LOCK_RETRY_MS);
+    }
+  }
+}
 
 async function withStoreLock(key, fn) {
   const previous = STORE_LOCKS.get(key) || Promise.resolve();
@@ -56,6 +97,7 @@ export class TaskHubStore {
     if (typeof idFactory !== "function") throw new Error("TaskHubStore idFactory must be a function.");
     this.dir = path.resolve(dir);
     this.tasksDir = path.join(this.dir, "tasks");
+    this.lockPath = path.join(this.dir, ".task-hub.lock");
     this.lockKey = process.platform === "win32" ? this.dir.toLowerCase() : this.dir;
     this.now = now;
     this.idFactory = idFactory;
@@ -86,8 +128,20 @@ export class TaskHubStore {
     await rename(temp, target);
   }
 
-  async createTask(input) {
+  async withWriteLock(fn) {
+    await this.ensureDir();
     return withStoreLock(this.lockKey, async () => {
+      const releaseFileLock = await acquireFileLock(this.lockPath);
+      try {
+        return await fn();
+      } finally {
+        await releaseFileLock();
+      }
+    });
+  }
+
+  async createTask(input) {
+    return this.withWriteLock(async () => {
       const record = createTaskRecord(input, { now: this.now() });
       if (await this.readTaskUnlocked(record.id)) throw new Error(`Task ${record.id} already exists.`);
       for (const dependencyId of record.depends_on) {
@@ -126,7 +180,7 @@ export class TaskHubStore {
   async claimTask(taskId, workerId, leaseMs) {
     workerId = assertWorkerId(workerId);
     leaseMs = assertLeaseDuration(leaseMs);
-    return withStoreLock(this.lockKey, async () => {
+    return this.withWriteLock(async () => {
       const task = await this.readTaskUnlocked(taskId);
       if (!task) throw new Error(`Task ${taskId} not found.`);
       const now = Number(this.now());
@@ -164,7 +218,7 @@ export class TaskHubStore {
     workerId = assertWorkerId(workerId);
     leaseMs = assertLeaseDuration(leaseMs);
     if (typeof leaseId !== "string" || !leaseId) throw new Error("lease id is required.");
-    return withStoreLock(this.lockKey, async () => {
+    return this.withWriteLock(async () => {
       const task = await this.readTaskUnlocked(taskId);
       if (!task) throw new Error(`Task ${taskId} not found.`);
       const now = Number(this.now());

@@ -1,6 +1,7 @@
 ﻿import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { spawn } from "node:child_process";
 import os from "node:os";
 import path from "node:path";
 
@@ -197,6 +198,38 @@ test("store rejects missing dependencies", async () => {
       /dependency.*not found|missing dependency/i
     );
     assert.equal(await store.getTask("orphan-task"), null);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("claim is atomic across separate Node processes", async () => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), "lca-task-hub-xproc-"));
+  try {
+    const store = new TaskHubStore({ dir });
+    await store.createTask(baseTask());
+
+    const workerPath = path.join(dir, "claim-worker.mjs");
+    const storeModuleUrl = new URL("./store.mjs", import.meta.url).href;
+    await writeFile(
+      workerPath,
+      `import { TaskHubStore } from ${JSON.stringify(storeModuleUrl)};\n` +
+        `const [dir, worker] = process.argv.slice(2);\n` +
+        `const store = new TaskHubStore({ dir });\n` +
+        `try { await store.claimTask("task-a", worker, 30000); process.exit(0); } catch { process.exit(2); }\n`,
+      "utf8"
+    );
+
+    const runWorker = (worker) => new Promise((resolve, reject) => {
+      const child = spawn(process.execPath, [workerPath, dir, worker], { stdio: "ignore" });
+      child.once("error", reject);
+      child.once("exit", (code) => resolve(code));
+    });
+
+    const results = await Promise.all(
+      Array.from({ length: 8 }, (_, index) => runWorker(`worker-${index + 1}`))
+    );
+    assert.equal(results.filter((code) => code === 0).length, 1);
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
