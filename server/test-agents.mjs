@@ -25,6 +25,7 @@ import {
   workspaceAgentsDir,
   buildCodexExecArgs,
   buildCodexPrompt,
+  parseTaskHubCodexResult,
   codexSandboxForMode,
   isPidAlive,
   AGENT_ID_RE
@@ -368,12 +369,38 @@ test("Task Hub Codex workers use isolated non-escalating CLI settings", () => {
   const approvalIdx = args.indexOf("--ask-for-approval");
   assert.ok(approvalIdx >= 0);
   assert.equal(args[approvalIdx + 1], "never");
+  assert.ok(approvalIdx < args.indexOf("exec"));
   const configIdx = args.indexOf("-c");
   assert.ok(configIdx >= 0);
   assert.equal(args[configIdx + 1], "sandbox_workspace_write.network_access=false");
   const sandboxIdx = args.indexOf("--sandbox");
   assert.ok(sandboxIdx >= 0);
   assert.equal(args[sandboxIdx + 1], "workspace-write");
+  const structured = buildCodexExecArgs(
+    { role: "coding_worker", sandbox_mode: "workspace-write", workspace_root: process.cwd(), writable_roots: [] },
+    { outputSchemaFile: "/tmp/task-hub-schema.json" }
+  );
+  const schemaIdx = structured.indexOf("--output-schema");
+  assert.ok(schemaIdx > structured.indexOf("exec"));
+  assert.equal(structured[schemaIdx + 1], "/tmp/task-hub-schema.json");
+});
+
+test("Task Hub Codex structured result fails closed on BLOCKED or malformed output", () => {
+  assert.deepEqual(parseTaskHubCodexResult('{"status":"DONE","summary":"verified","evidence":["tests pass"]}'), {
+    ok: true,
+    status: "DONE",
+    summary: "verified",
+    evidence: ["tests pass"]
+  });
+  assert.deepEqual(parseTaskHubCodexResult('{"status":"BLOCKED","summary":"sandbox denied write","evidence":["no file changed"]}'), {
+    ok: false,
+    status: "BLOCKED",
+    summary: "sandbox denied write",
+    evidence: ["no file changed"]
+  });
+  const malformed = parseTaskHubCodexResult("not-json");
+  assert.equal(malformed.ok, false);
+  assert.equal(malformed.status, "BLOCKED");
 });
 
 test("buildCodexExecArgs passes distinct writable roots through --add-dir", () => {

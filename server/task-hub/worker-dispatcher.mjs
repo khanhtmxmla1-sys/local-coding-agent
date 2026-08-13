@@ -130,7 +130,7 @@ export class TaskHubDispatcher {
       await this.store.submitResult(session.task_id, session.worker_id, session.lease_id, summary || "Worker completed.");
     } else {
       const result = await this.agentManager.result(session.local_agent_id, 2000).catch(() => null);
-      const reason = compactError(result?.error || settled?.error || `worker ended with status ${status || "unknown"}`);
+      const reason = compactError(result?.summary || result?.error || settled?.error || `worker ended with status ${status || "unknown"}`);
       await this.store.blockClaim(session.task_id, session.worker_id, session.lease_id, `Worker ${status || "failed"}: ${reason}`);
     }
   }
