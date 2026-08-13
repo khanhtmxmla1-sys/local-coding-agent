@@ -16,6 +16,7 @@ import {
   AgentManager,
   ROLES,
   getRole,
+  isTaskHubManagedRole,
   generateAgentId,
   redactSecrets,
   truncateForChat,
@@ -73,7 +74,12 @@ test("truncateForChat caps long text and flags truncation", () => {
 test("getRole validates roles", () => {
   assert.equal(getRole("bug_fix").name, "bug_fix");
   assert.throws(() => getRole("nope_agent"), /Unknown role/);
-  assert.equal(Object.keys(ROLES).length, 6);
+  assert.equal(Object.keys(ROLES).length, 8);
+  assert.equal(getRole("coding_worker").name, "coding_worker");
+  assert.equal(getRole("reviewer_worker").name, "reviewer_worker");
+  assert.equal(isTaskHubManagedRole("coding_worker"), true);
+  assert.equal(isTaskHubManagedRole("reviewer_worker"), true);
+  assert.equal(isTaskHubManagedRole("bug_fix"), false);
 });
 
 test("makeLocalReportPath rejects bad ids", () => {
@@ -352,6 +358,22 @@ test("buildCodexExecArgs sets sandbox, cwd, non-interactive flags, stdin prompt"
   const oIdx = full.indexOf("--output-last-message");
   assert.ok(oIdx >= 0);
   assert.equal(full[oIdx + 1], "/tmp/last.txt");
+});
+
+test("Task Hub Codex workers use isolated non-escalating CLI settings", () => {
+  const args = buildCodexExecArgs({ role: "coding_worker", mode: "full", sandbox_mode: "workspace-write", workspace_root: process.cwd(), writable_roots: [] });
+  assert.ok(args.includes("--ephemeral"));
+  assert.ok(args.includes("--ignore-user-config"));
+  assert.ok(args.includes("--ignore-rules"));
+  const approvalIdx = args.indexOf("--ask-for-approval");
+  assert.ok(approvalIdx >= 0);
+  assert.equal(args[approvalIdx + 1], "never");
+  const configIdx = args.indexOf("-c");
+  assert.ok(configIdx >= 0);
+  assert.equal(args[configIdx + 1], "sandbox_workspace_write.network_access=false");
+  const sandboxIdx = args.indexOf("--sandbox");
+  assert.ok(sandboxIdx >= 0);
+  assert.equal(args[sandboxIdx + 1], "workspace-write");
 });
 
 test("buildCodexExecArgs passes distinct writable roots through --add-dir", () => {

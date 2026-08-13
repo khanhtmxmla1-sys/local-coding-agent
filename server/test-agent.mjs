@@ -16,6 +16,15 @@ console.log("TOOLS:", tools.tools.map((t) => t.name).join(", "));
 let pass = 0;
 let fail = 0;
 
+const toolNames = new Set(tools.tools.map((tool) => tool.name));
+const workerToolsOk = ["task_hub_project_register", "task_hub_project_get", "task_hub_project_list", "task_hub_dispatch", "task_hub_worker_status"].every((name) => toolNames.has(name));
+if (workerToolsOk) pass++; else fail++;
+
+const localTaskTool = tools.tools.find((tool) => tool.name === "create_local_task");
+const localRoleEnum = localTaskTool?.inputSchema?.properties?.role?.enum || [];
+const internalRolesHidden = !localRoleEnum.includes("coding_worker") && !localRoleEnum.includes("reviewer_worker");
+if (internalRolesHidden) pass++; else fail++;
+
 async function call(name, args, { expectError = false } = {}) {
   const result = await client.callTool({ name, arguments: args });
   const text = result.content?.[0]?.text ?? "";

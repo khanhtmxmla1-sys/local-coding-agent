@@ -159,8 +159,36 @@ export const ROLES = {
       "Flag any public-tunnel exposure without MCP_AUTH_TOKEN."
     ],
     default_output: "security findings checklist"
+  },
+  coding_worker: {
+    name: "coding_worker",
+    description: "Implements one bounded Task Hub coding task inside one registered project workspace and verifies the result.",
+    allowed_task_type: "bounded code implementation and tests",
+    safety_notes: [
+      "Never commit, push, open a PR, merge, migrate, deploy, or write to production.",
+      "Stay inside the assigned project workspace and Task Hub scope.",
+      "Return concise verification evidence without secrets."
+    ],
+    default_output: "implementation evidence summary"
+  },
+  reviewer_worker: {
+    name: "reviewer_worker",
+    description: "Performs an independent read-only review of one Task Hub task with file/line evidence.",
+    allowed_task_type: "read-only code and verification review",
+    safety_notes: [
+      "Do not edit files or run mutating commands.",
+      "Report P1/P2/P3 findings with file:line evidence.",
+      "Never expose secrets in findings."
+    ],
+    default_output: "review findings"
   }
 };
+
+const TASK_HUB_MANAGED_ROLES = new Set(["coding_worker", "reviewer_worker"]);
+
+export function isTaskHubManagedRole(name) {
+  return TASK_HUB_MANAGED_ROLES.has(String(name));
+}
 
 export function getRole(name) {
   const role = ROLES[String(name)];
@@ -232,6 +260,18 @@ const ROLE_PLAYBOOK = {
     "2. Review command execution paths and mode/policy gates.",
     "3. Confirm the server binds loopback and is not on a public tunnel without auth.",
     "4. Verify approvals are one-time and workspace-scoped."
+  ],
+  coding_worker: () => [
+    "1. Inspect only the files needed for the bounded task.",
+    "2. Implement the smallest correct change inside the assigned workspace.",
+    "3. Run relevant tests/checks and inspect the diff.",
+    "4. Return concise evidence; do not perform Git delivery or deployment actions."
+  ],
+  reviewer_worker: () => [
+    "1. Inspect the task scope, diff, and verification evidence read-only.",
+    "2. Identify correctness, regression, and security issues by severity.",
+    "3. Cite file:line evidence for actionable findings.",
+    "4. Return a concise review; do not edit files."
   ]
 };
 
@@ -335,6 +375,9 @@ export function codexSandboxForMeta(meta = {}) {
 export function buildCodexExecArgs(meta, opts = {}) {
   const args = ["exec"];
   const sandbox = codexSandboxForMeta(meta);
+  if (isTaskHubManagedRole(meta.role)) {
+    args.push("--ephemeral", "--ignore-user-config", "--ignore-rules", "--ask-for-approval", "never", "-c", "sandbox_workspace_write.network_access=false");
+  }
   args.push("--sandbox", sandbox);
   args.push("--skip-git-repo-check");
   args.push("--color", "never");
