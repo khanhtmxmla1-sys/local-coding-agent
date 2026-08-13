@@ -34,6 +34,10 @@ jobs:
           node --check server.mjs
           node --check context-memory.mjs
           node --check context-memory.test.mjs
+          node --check task-hub/model.mjs
+          node --check task-hub/store.mjs
+          node --check task-hub/lease-proof.mjs
+          npm run test:task-hub
           node --check test-agent.mjs
           node --check test-security.mjs
           node --check security-test.mjs
@@ -178,6 +182,9 @@ jobs:
           node-version: 24
           cache: npm
           cache-dependency-path: desktop-app/package-lock.json
+      - name: Install locked server dependencies
+        run: npm ci
+        working-directory: server
       - name: Install locked desktop dependencies
         run: npm ci
         working-directory: desktop-app
