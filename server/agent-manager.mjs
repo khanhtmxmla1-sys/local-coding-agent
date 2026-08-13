@@ -406,12 +406,21 @@ export function parseTaskHubCodexResult(raw) {
 export function buildCodexExecArgs(meta, opts = {}) {
   const args = [];
   const sandbox = codexSandboxForMeta(meta);
+  const platform = String(opts.platform || process.platform);
   if (isTaskHubManagedRole(meta.role)) {
     args.push("--ask-for-approval", "never");
   }
   args.push("exec");
   if (isTaskHubManagedRole(meta.role)) {
     args.push("--ephemeral", "--ignore-user-config", "--ignore-rules", "-c", "sandbox_workspace_write.network_access=false");
+    // --ignore-user-config intentionally drops the user's Codex settings. On
+    // native Windows that also removes the sandbox backend selection, and Codex
+    // then fails closed by downgrading workspace-write to read-only. Re-declare
+    // only the allowlisted backend needed by Task Hub coding workers; keep all
+    // other user config ignored and keep network/approval escalation disabled.
+    if (platform === "win32" && sandbox === "workspace-write") {
+      args.push("-c", 'windows.sandbox="elevated"');
+    }
   }
   if (opts.outputSchemaFile) args.push("--output-schema", opts.outputSchemaFile);
   args.push("--sandbox", sandbox);

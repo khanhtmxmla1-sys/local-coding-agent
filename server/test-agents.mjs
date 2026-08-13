@@ -376,6 +376,23 @@ test("Task Hub Codex workers use isolated non-escalating CLI settings", () => {
   const sandboxIdx = args.indexOf("--sandbox");
   assert.ok(sandboxIdx >= 0);
   assert.equal(args[sandboxIdx + 1], "workspace-write");
+  const windowsArgs = buildCodexExecArgs(
+    { role: "coding_worker", sandbox_mode: "workspace-write", workspace_root: process.cwd(), writable_roots: [] },
+    { platform: "win32" }
+  );
+  const windowsConfigIdx = windowsArgs.findIndex((value, index) => value === "-c" && windowsArgs[index + 1] === 'windows.sandbox="elevated"');
+  assert.ok(windowsConfigIdx > windowsArgs.indexOf("exec"));
+  assert.ok(windowsConfigIdx < windowsArgs.indexOf("--sandbox"));
+  const reviewerArgs = buildCodexExecArgs(
+    { role: "reviewer_worker", sandbox_mode: "read-only", workspace_root: process.cwd(), writable_roots: [] },
+    { platform: "win32" }
+  );
+  assert.equal(reviewerArgs.includes('windows.sandbox="elevated"'), false);
+  const linuxArgs = buildCodexExecArgs(
+    { role: "coding_worker", sandbox_mode: "workspace-write", workspace_root: process.cwd(), writable_roots: [] },
+    { platform: "linux" }
+  );
+  assert.equal(linuxArgs.includes('windows.sandbox="elevated"'), false);
   const structured = buildCodexExecArgs(
     { role: "coding_worker", sandbox_mode: "workspace-write", workspace_root: process.cwd(), writable_roots: [] },
     { outputSchemaFile: "/tmp/task-hub-schema.json" }
