@@ -16,6 +16,7 @@
     "test:security": "node test-security.mjs",
     "test:security:baseline": "node security-test.mjs",
     "test:hardening": "node test-hardening.mjs",
+    "test:agents-compliance": "node --test agents-compliance.test.mjs",
     "test:pro": "node test-pro.mjs",
     "test:agents": "node --test test-agents.mjs",
     "test:permissions": "node --test permission-resolver.test.mjs permission-preview.test.mjs ../scripts/permission-cli.test.mjs",

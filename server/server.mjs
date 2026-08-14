@@ -658,7 +658,8 @@ async function handleMcp(req, res) {
 }
 
 const SERVER_INSTRUCTIONS = [
-  "Local Coding Agent Pro MCP: tool calls cross a tunnel, so start with workspace_snapshot or workspace_doctor, then use read_many/search_text/run_commands to batch work; prefer dedicated tools over run_command. Policy may require local dashboard approval for risky delete/install/network/mutating-git actions; exact action batches can use request_approval_batch. File tools are root-confined, but commands are not an OS sandbox.",
+  "BOOTSTRAP HARD GATE: Call workspace_bootstrap before coding work. If required=true, read AGENTS.md instructions fully and pass the returned sha256 as workspace_rules_sha on every gated mutation/command call. Missing or stale hashes fail closed.",
+  "Local Coding Agent Pro MCP: tool calls cross a tunnel, so after workspace_bootstrap start with workspace_snapshot or workspace_doctor, then use read_many/search_text/run_commands to batch work; prefer dedicated tools over run_command. Policy may require local dashboard approval for risky delete/install/network/mutating-git actions; exact action batches can use request_approval_batch. File tools are root-confined, but commands are not an OS sandbox.",
   "WORKFLOW: (1) Start with workspace_snapshot for repo/git/test/policy/health in one call; use workspace_doctor when you need operational readiness. (2) Use preview_patch/validate_patch before apply_patch for large edits. (3) After editing source, run quality_gate, run_tests, or run_changed_tests. (4) Before marking 'done', call review_diff and session_report. (5) For multi-step tasks, use task_plan + decision_log to maintain state across chats.",
   "POLICY: Check policy_status if you are unsure whether an action is allowed. In balanced policy, risky operations (delete, install, network, mutating git, risky processes) require one-time local approval.",
   "Use the DEDICATED tools instead of run_command for these — they are faster and cheaper:",
@@ -867,9 +868,72 @@ function isWithinSkillsDir(p) {
 
 // ----------------------------------------------------------------------------
 // Tool registration helper: audit + uniform error handling
+const WORKSPACE_RULES_SHA_ARG = "workspace_rules_sha";
+const WORKSPACE_RULE_GATED_TOOLS = new Set([
+  "write_file", "replace_in_file", "apply_patch", "make_dir", "move_path", "delete_path", "undo_last_patch",
+  "create_skill", "delete_skill",
+  "run_command", "run_commands", "proc_start", "proc_stop",
+  "git", "quality_gate", "run_tests", "run_build", "run_lint", "run_changed_tests",
+  "task_plan", "task_state", "decision_log"
+]);
+
+function withWorkspaceRulesInput(name, def) {
+  if (!WORKSPACE_RULE_GATED_TOOLS.has(name)) return def;
+  return {
+    ...def,
+    inputSchema: {
+      ...(def.inputSchema || {}),
+      [WORKSPACE_RULES_SHA_ARG]: z.string().regex(/^[a-f0-9]{64}$/i).optional().describe(
+        "SHA-256 returned by workspace_bootstrap after reading the current workspace AGENTS.md. Required for coding mutations when AGENTS.md exists."
+      )
+    }
+  };
+}
+
+async function workspaceRulesSnapshot({ includeInstructions = true } = {}) {
+  const rulesPath = path.join(PRIMARY_ROOT, "AGENTS.md");
+  if (!existsSync(rulesPath)) {
+    return { required: false, path: rulesPath, sha256: null, instructions: null };
+  }
+  const decision = PERMISSION_RESOLVER.explain(rulesPath, "read");
+  if (!decision.allowed) {
+    throw new Error(`Workspace AGENTS.md exists but cannot be read [${decision.reason}]. Refusing coding mutations.`);
+  }
+  const instructions = await readFile(rulesPath, "utf8");
+  const sha256 = createHash("sha256").update(instructions).digest("hex");
+  return {
+    required: true,
+    path: rulesPath,
+    sha256,
+    instructions: includeInstructions ? instructions : undefined
+  };
+}
+
+function workspaceRulesRequiredForCall(tool, args) {
+  if (!WORKSPACE_RULE_GATED_TOOLS.has(tool)) return false;
+  if (tool === "git") {
+    const argv = Array.isArray(args?.args) ? args.args : [];
+    const sub = (argv.find((item) => !String(item).startsWith("-")) || "").toLowerCase();
+    if (GIT_READONLY.has(sub) || argv.some((item) => /^(--version|--help)$/i.test(String(item)))) return false;
+  }
+  return true;
+}
+
+async function enforceWorkspaceRules(tool, args) {
+  if (!workspaceRulesRequiredForCall(tool, args)) return;
+  const snapshot = await workspaceRulesSnapshot({ includeInstructions: false });
+  if (!snapshot.required) return;
+  const provided = String(args?.[WORKSPACE_RULES_SHA_ARG] || "").toLowerCase();
+  if (!provided) {
+    throw new Error(`Workspace AGENTS.md is mandatory before tool "${tool}". Call workspace_bootstrap, read its instructions, then retry with ${WORKSPACE_RULES_SHA_ARG}=<sha256>.`);
+  }
+  if (!safeEqual(provided, snapshot.sha256)) {
+    throw new Error(`Workspace AGENTS.md changed or the supplied ${WORKSPACE_RULES_SHA_ARG} is invalid. Call workspace_bootstrap again before tool "${tool}".`);
+  }
+}
 // ----------------------------------------------------------------------------
 function reg(mcp, name, def, handler) {
-  mcp.registerTool(name, def, async (args, extra) => {
+  mcp.registerTool(name, withWorkspaceRulesInput(name, def), async (args, extra) => {
     const context = { tool: name, capability: toolPathCapability(name), commandMode: null, onceGrantIds: new Set() };
     return permissionContext.run(context, async () => {
       const startedAt = isoNow();
@@ -878,6 +942,7 @@ function reg(mcp, name, def, handler) {
       let result;
       let ok = true;
       try {
+        await enforceWorkspaceRules(name, args ?? {});
         await enforceToolPolicy(name, args ?? {});
         result = await handler(args ?? {}, extra);
       } catch (err) {
@@ -947,6 +1012,25 @@ function registerBasicTools(mcp) {
             ? ["File tools are root-confined; command cwd is root-confined but command execution is not an OS sandbox.", "Catastrophic system commands stay blocked unless AGENT_ALLOW_DANGEROUS=1.", "Prompt-requested shutdown is available only through its dedicated tray opt-in tool.", "Paths outside the roots are rejected by file tools."]
             : ["File tools are root-confined; command cwd is root-confined but command execution is not an OS sandbox.", "Destructive commands and absolute Windows paths in commands are blocked.", "Prompt-requested shutdown is available only through its dedicated tray opt-in tool.", "Switch to AGENT_MODE=full only for trusted automation."]
       })
+  );
+
+  reg(
+    mcp,
+    "workspace_bootstrap",
+    {
+      title: "Workspace bootstrap",
+      description: "Read the root AGENTS.md when present and return the exact SHA-256 required by coding mutation tools. Call this before coding work.",
+      inputSchema: {}
+    },
+    async () => {
+      const snapshot = await workspaceRulesSnapshot();
+      return jsonResult({
+        ...snapshot,
+        next_step: snapshot.required
+          ? `Read instructions fully, follow them, and pass ${WORKSPACE_RULES_SHA_ARG}=sha256 on every gated coding mutation.`
+          : "No root AGENTS.md is present; current mutation behavior is unchanged."
+      });
+    }
   );
 
   reg(
