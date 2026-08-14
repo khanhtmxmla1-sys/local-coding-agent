@@ -660,7 +660,7 @@ async function handleMcp(req, res) {
 const SERVER_INSTRUCTIONS = [
   "Local Coding Agent Pro MCP: tool calls cross a tunnel, so start with workspace_snapshot or workspace_doctor, then use read_many/search_text/run_commands to batch work; prefer dedicated tools over run_command. Policy may require local dashboard approval for risky delete/install/network/mutating-git actions; exact action batches can use request_approval_batch. File tools are root-confined, but commands are not an OS sandbox.",
   "WORKFLOW: (1) Start with workspace_snapshot for repo/git/test/policy/health in one call; use workspace_doctor when you need operational readiness. (2) Use preview_patch/validate_patch before apply_patch for large edits. (3) After editing source, run quality_gate, run_tests, or run_changed_tests. (4) Before marking 'done', call review_diff and session_report. (5) For multi-step tasks, use task_plan + decision_log to maintain state across chats.",
-  "POLICY: Check policy_status if you are unsure whether an action is allowed. In balanced policy, risky operations (delete, install, network, mutating git, risky processes) require one-time local approval.",
+  "POLICY: Check policy_status if you are unsure whether an action is allowed. Balanced policy requires exact local approval for risky operations; full policy bypasses action approval only within already-authorized roots.",
   "Use the DEDICATED tools instead of run_command for these — they are faster and cheaper:",
   "- Find files by name -> find_files (NOT dir/ls/Get-ChildItem/where).",
   "- Search file contents -> search_text with context= (NOT grep/findstr/Select-String).",
@@ -677,7 +677,7 @@ const SERVER_INSTRUCTIONS = [
   "Anti-lag workflow: do not paste full logs, full diffs, base64 blobs, image/icon inventories, or repeated single-file reads into chat. Save detailed output to local files or reports, then return a compact summary with paths and next actions.",
   "Prefer targeted line ranges, globs, read_many with max_chars, and run_command/run_commands with max_output_chars so long ChatGPT Web threads stay responsive.",
   "ChatGPT Web compact workflow: when the conversation grows long or feels slow, call context_status. If it recommends compacting, call compact_context with only established facts, decisions, constraints, completed work, open tasks, and the next action. Never include credentials or full source/log content. Then tell the user to open a NEW chat; in that fresh chat call resume_context FIRST and verify workspace_info/git_status before editing.",
-  "AI Task Hub orchestration: task_hub_create always starts DRAFT. Register each project once with task_hub_project_register (exact local approval), advance the task to READY, then use task_hub_dispatch for supported real workers. CODING and REVIEWER use the registered project workspace; BROWSER fails closed until a browser-capable worker exists. Manual workers may still use claim/heartbeat/submit_result. Never copy lease credentials into notes, reports, or chat summaries.",
+  "AI Task Hub orchestration: task_hub_create always starts DRAFT. Register each project once with task_hub_project_register, advance the task to READY, then use task_hub_dispatch for supported real workers. Task Hub uses the server's active policy-aware exact-action authorization: balanced requires exact local approval while full bypasses action approval only within already-authorized roots. CODING and REVIEWER use the registered project workspace; BROWSER fails closed until a browser-capable worker exists. Manual workers may still use claim/heartbeat/submit_result. Never copy lease credentials into notes, reports, or chat summaries.",
   "If a task matches an available skill, call list_skills first, then read_skill(name) to load its instructions before doing the work.",
   "Prefer a few large, well-targeted calls over many tiny ones.",
   ...(PREVIEW_ENABLED
@@ -712,7 +712,7 @@ function createMcpServer() {
     reg,
     store: TASK_HUB_STORE,
     jsonResult,
-    authorizeAction: consumeExactApproval,
+    authorizeAction: authorizeExactAction,
     checkFreshness: checkTaskHubFreshness,
     prepareClaimContext: prepareTaskHubClaimContext
   });
@@ -721,7 +721,7 @@ function createMcpServer() {
     jsonResult,
     registry: TASK_HUB_PROJECT_REGISTRY,
     dispatcher: TASK_HUB_DISPATCHER,
-    authorizeAction: consumeExactApproval,
+    authorizeAction: authorizeExactAction,
     resolveRegistrationWorkspace: resolveTaskHubRegistrationWorkspace
   });
   registerProfileTools(mcp);      // v2.8
@@ -4344,7 +4344,7 @@ function manualRefresh(){
   loadV5();
   loadApprovals();
   if(activeView==='tasks') loadAgents();
-  if(activeView==='files') loadTree();
+  if(activeView==='files') refreshFilesView();
 }
 window.addEventListener('hashchange',initialView);
 function renderCards(d){
@@ -4471,14 +4471,16 @@ async function clearMetrics(){
 }
 
 // ---- Mini-IDE (Files) ----
-var diffMode=false, selPath=null;
-function loadTree(){
+var diffMode=false, selPath=null, treeRequestSeq=0;
+function loadTree(options){
+  options=options||{};
+  var requestSeq=++treeRequestSeq;
   treeLoaded=true;
-  diffMode=false; var db=document.getElementById('diffBtn'); if(db) db.classList.remove('active');
-  document.getElementById('tree').innerHTML='<div class="empty-state">Đang tải cây thư mục…</div>';
+  if(!options.background) document.getElementById('tree').innerHTML='<div class="empty-state">Đang tải cây thư mục…</div>';
   fetch('/api/tree',{cache:'no-store'}).then(function(r){return r.json();}).then(function(d){
+    if(requestSeq!==treeRequestSeq) return;
     var el=document.getElementById('tree');
-    if(d.error){ el.innerHTML='<div class="note" style="padding:8px 12px">'+esc(d.error)+'</div>'; return; }
+    if(d.error){ if(!options.background) el.innerHTML='<div class="note" style="padding:8px 12px">'+esc(d.error)+'</div>'; return; }
     var html='';
     (d.entries||[]).forEach(function(e){
       var depth=(e.path.match(/\\//g)||[]).length;
@@ -4487,26 +4489,31 @@ function loadTree(){
       if(e.type==='directory'){
         html+='<div class="tnode dir" style="padding-left:'+pad+'px">'+esc(name)+'/</div>';
       }else{
-        html+='<div class="tnode" data-path="'+esc(e.path)+'" style="padding-left:'+pad+'px" onclick="openFile(this)">'+esc(name)+'</div>';
+        html+='<div class="tnode'+(e.path===selPath?' sel':'')+'" data-path="'+esc(e.path)+'" style="padding-left:'+pad+'px" onclick="openFile(this)">'+esc(name)+'</div>';
       }
     });
     if(d.truncated) html+='<div class="note" style="padding:8px 12px">… danh sách đã được giới hạn</div>';
     el.innerHTML=html||'<div class="empty-state">Thư mục trống.</div>';
-  }).catch(function(e){ document.getElementById('tree').innerHTML='<div class="empty-state">Không thể tải cây thư mục.</div>'; });
+    if(options.background){ if(diffMode) refreshDiff(); else if(selPath) refreshSelectedFile(); }
+  }).catch(function(e){ if(requestSeq!==treeRequestSeq) return; if(!options.background) document.getElementById('tree').innerHTML='<div class="empty-state">Không thể tải cây thư mục.</div>'; });
 }
 function openFile(node){
   var p=node.getAttribute('data-path'); selPath=p; diffMode=false;
   var db=document.getElementById('diffBtn'); if(db) db.classList.remove('active');
   document.querySelectorAll('.tnode.sel').forEach(function(n){n.classList.remove('sel');});
   node.classList.add('sel');
-  document.getElementById('viewPath').textContent=p;
-  document.getElementById('viewMeta').textContent='';
-  var body=document.getElementById('viewBody'); body.className='ide-body'; body.textContent='Loading…';
+  loadSelectedFile(p,false);
+}
+function loadSelectedFile(p,background){
+  var body=document.getElementById('viewBody');
+  if(!background){ document.getElementById('viewPath').textContent=p; document.getElementById('viewMeta').textContent=''; body.className='ide-body'; body.textContent='Loading…'; }
   fetch('/api/file?path='+encodeURIComponent(p),{cache:'no-store'}).then(function(r){return r.json();}).then(function(d){
-    if(d.error){ body.textContent='Error: '+d.error; return; }
+    if(selPath!==p || diffMode) return;
+    if(d.error){ if(!background) body.textContent='Error: '+d.error; return; }
+    if(background){ document.getElementById('viewPath').textContent=p; document.getElementById('viewMeta').textContent=''; }
     body.textContent=d.content||'';
     document.getElementById('viewMeta').textContent=h(d.total_lines)+' lines'+(d.truncated?' · truncated':'');
-  }).catch(function(e){ body.textContent='offline'; });
+  }).catch(function(e){ if(selPath!==p || diffMode) return; if(!background) body.textContent='offline'; });
 }
 function renderDiff(text){
   var body=document.getElementById('viewBody'); body.className='ide-body diff';
@@ -4524,15 +4531,21 @@ function renderDiff(text){
 function toggleDiff(){
   diffMode=!diffMode;
   var db=document.getElementById('diffBtn');
-  if(!diffMode){ db.classList.remove('active'); document.getElementById('viewPath').textContent=selPath||'Chọn một tệp.'; var b=document.getElementById('viewBody'); b.className='ide-body'; b.textContent=''; return; }
+  if(!diffMode){ db.classList.remove('active'); if(selPath) loadSelectedFile(selPath,false); else { document.getElementById('viewPath').textContent='Chọn một tệp.'; var b=document.getElementById('viewBody'); b.className='ide-body'; b.textContent=''; } return; }
   db.classList.add('active');
-  document.getElementById('viewPath').textContent='git diff (primary root)';
-  document.getElementById('viewMeta').textContent='';
-  var body=document.getElementById('viewBody'); body.className='ide-body'; body.textContent='Loading…';
+  loadDiff(false);
+}
+function refreshSelectedFile(){ if(selPath) loadSelectedFile(selPath,true); }
+function refreshDiff(){ if(diffMode) loadDiff(true); }
+function refreshFilesView(){ loadTree({background:true}); }
+function loadDiff(background){
+  var body=document.getElementById('viewBody');
+  if(!background){ document.getElementById('viewPath').textContent='git diff (primary root)'; document.getElementById('viewMeta').textContent=''; body.className='ide-body'; body.textContent='Loading…'; }
   fetch('/api/diff',{cache:'no-store'}).then(function(r){return r.json();}).then(function(d){
-    if(d.error){ body.textContent='Error: '+d.error; return; }
+    if(!diffMode) return;
+    if(d.error){ if(!background) body.textContent='Error: '+d.error; return; }
     renderDiff(d.diff||'');
-  }).catch(function(e){ body.textContent='offline'; });
+  }).catch(function(e){ if(!diffMode) return; if(!background) body.textContent='offline'; });
 }
 // ---- v5 local-first panel (anti-lag) ----
 var v5Off=0, v5Limit=20, v5Total=0, v5Prompts={};
@@ -4674,9 +4687,15 @@ async function agFetch(){
 }
 document.getElementById('v5agfilter').addEventListener('click',function(e){ var k=e.target.getAttribute('data-k'); if(k) agSetFilter(k); });
 document.getElementById('v5agents').addEventListener('click',function(e){ var id=e.target.getAttribute('data-id'); if(id) agOpen(id); });
+function refreshActiveView(){
+  loadV5();
+  if(activeView==='tasks') loadAgents();
+  else if(activeView==='files') refreshFilesView();
+}
 initialView();
-loadV5(); setInterval(loadV5,5000);
-loadAgents(); setInterval(function(){ if(activeView==='tasks') loadAgents(); },5000);
+loadV5();
+loadAgents();
+setInterval(refreshActiveView,5000);
 tick(); setInterval(tick,2500);
 </script>
 </body>
@@ -6409,7 +6428,7 @@ async function dashApiApprovals(res) {
           record.status = "expired";
           record.expired_at = isoNow();
           await writeFile(path.join(APPROVALS_DIR, file), JSON.stringify(record, null, 2), "utf8");
-        } else if (record.status === "pending") records.push(record);
+        } else if (record.status === "pending" && (AGENT_POLICY !== "full" || record.kind === "path_access")) records.push(record);
       } catch {}
     }
     records.sort((a, b) => String(b.created).localeCompare(String(a.created)));
@@ -6469,6 +6488,11 @@ async function enforceToolPolicy(tool, args) {
   if (AGENT_POLICY !== "balanced") return;
   const action = approvalActionForTool(tool, args);
   if (!action) return;
+  return consumeExactApproval(action);
+}
+
+async function authorizeExactAction(action) {
+  if (AGENT_POLICY === "full") return;
   return consumeExactApproval(action);
 }
 

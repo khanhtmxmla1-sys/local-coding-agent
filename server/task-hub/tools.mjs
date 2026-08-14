@@ -87,7 +87,7 @@ export function registerTaskHubTools(mcp, { reg, store, jsonResult, authorizeAct
   });
 
   reg(mcp, "task_hub_transition", {
-    title: "Transition Task Hub task", description: "Move a non-running task through the explicit lifecycle using optimistic version checks. Approval-bearing gates consume one exact local approval.",
+    title: "Transition Task Hub task", description: "Move a non-running task through the explicit lifecycle using optimistic version checks. Uses the server's active policy-aware exact-action authorization for approval-bearing gates.",
     inputSchema: { id: z.string().min(1).max(128), to: z.enum(STATUS_VALUES), expected_version: z.number().int().min(1), blocked_reason: z.string().max(2000).optional() }
   }, async ({ id, to, expected_version, blocked_reason }) => {
     const task = await store.getTask(id);

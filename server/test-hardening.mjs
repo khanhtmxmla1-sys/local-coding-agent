@@ -3,7 +3,7 @@
 
 import http from "node:http";
 import { spawn } from "node:child_process";
-import { mkdir, mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
@@ -34,7 +34,7 @@ async function waitFor(url) {
   throw new Error(`Server did not become ready: ${url}`);
 }
 
-async function startServer(workspace, { port, dashboardPort = 0, policy = "strict", auth = "", approvalToken = "", maxBody = "1048576" }) {
+async function startServer(workspace, { port, dashboardPort = 0, policy = "strict", auth = "", approvalToken = "", maxBody = "1048576", approvalsDir = `${workspace}-approvals`, taskHubDir = `${workspace}-task-hub`, taskHubProjectsDir = `${workspace}-task-hub-projects` }) {
   await mkdir(workspace, { recursive: true });
   const child = spawn(process.execPath, [SERVER], {
     cwd: path.dirname(SERVER),
@@ -48,7 +48,9 @@ async function startServer(workspace, { port, dashboardPort = 0, policy = "stric
       AGENT_EXTRA_ROOTS_JSON: "[]",
       MCP_AUTH_TOKEN: auth,
       AGENT_APPROVAL_TOKEN: approvalToken,
-      AGENT_APPROVALS_DIR: `${workspace}-approvals`,
+      AGENT_APPROVALS_DIR: approvalsDir,
+      AGENT_TASK_HUB_DIR: taskHubDir,
+      AGENT_TASK_HUB_PROJECTS_DIR: taskHubProjectsDir,
       AGENT_MAX_BODY_BYTES: maxBody
     },
     windowsHide: true,
@@ -246,6 +248,52 @@ try {
   const other = await connect(19005);
   check("new workspace cannot undo another workspace history", (await call(other, "undo_last_patch")).isError);
   await other.close();
+  await stopServer(server);
+  server = null;
+
+  // Full policy bypasses action approvals but keeps path-access approvals visible.
+  console.log("\n[phase] full policy Task Hub and approval visibility");
+  const fullWorkspace = path.join(base, "full-task-hub");
+  const fullApprovals = path.join(base, "full-approvals");
+  const fullTaskHub = path.join(base, "full-task-hub-state");
+  const fullProjects = path.join(base, "full-project-state");
+  await mkdir(fullApprovals, { recursive: true });
+  await writeFile(path.join(fullApprovals, "ordinary.json"), JSON.stringify({
+    id: "ordinary", status: "pending", kind: "exact_action", action: "delete_path:historical.txt", created: new Date().toISOString()
+  }));
+  await writeFile(path.join(fullApprovals, "path.json"), JSON.stringify({
+    id: "path", status: "pending", kind: "path_access", path_access: { path: path.join(base, "extra-root"), preset: "observe", scope: "session" }, created: new Date().toISOString()
+  }));
+  server = await startServer(fullWorkspace, {
+    port: 19009, dashboardPort: 19010, policy: "full", approvalsDir: fullApprovals,
+    taskHubDir: fullTaskHub, taskHubProjectsDir: fullProjects
+  });
+  const fullHub = await connect(19009);
+  const registered = await call(fullHub, "task_hub_project_register", {
+    id: "full-fixture", workspace_root: fullWorkspace, allowed_roles: ["CODING"]
+  });
+  check("full policy registers Task Hub project without request_approval", !registered.isError);
+  const created = JSON.parse((await call(fullHub, "task_hub_create", {
+    id: "full-task", project_id: "full-fixture", goal: "full policy regression"
+  })).text);
+  const planned = await call(fullHub, "task_hub_transition", { id: "full-task", to: "PLANNED", expected_version: created.task.version });
+  const approved = await call(fullHub, "task_hub_transition", { id: "full-task", to: "APPROVED", expected_version: 2 });
+  check("full policy transitions PLANNED -> APPROVED without dashboard approval", !planned.isError && !approved.isError);
+  const visibleApprovals = (await (await fetch("http://127.0.0.1:19010/api/approvals")).json()).pending || [];
+  check("full dashboard hides ordinary pending action approvals", !visibleApprovals.some((record) => record.id === "ordinary"));
+  check("full dashboard retains pending path-access approvals", visibleApprovals.some((record) => record.id === "path" && record.kind === "path_access"));
+  await fullHub.close();
+  await stopServer(server);
+  server = null;
+
+  // Dashboard source regressions stay in this hardening suite so no extra test files are needed.
+  const source = await readFile(SERVER, "utf8");
+  check("dashboard refreshes v5 and branches Tasks/Files", /function refreshActiveView\(\)\{[\s\S]*loadV5\(\);[\s\S]*activeView==='tasks'\) loadAgents\(\);[\s\S]*activeView==='files'\) refreshFilesView\(\);/.test(source));
+  check("dashboard has one active-view refresh coordinator", (source.match(/setInterval\(refreshActiveView,5000\)/g) || []).length === 1);
+  check("selected-file responses guard current selection and view", /if\(selPath!==p \|\| diffMode\) return;[\s\S]*body\.textContent=d\.content/.test(source) && /if\(selPath!==p \|\| diffMode\) return; if\(!background\) body\.textContent='offline'/.test(source));
+  check("diff responses guard diff mode before render", /if\(!diffMode\) return;[\s\S]*renderDiff\(d\.diff\|\|''\)/.test(source));
+  check("tree responses use sequencing and preserve selection", /var requestSeq=\+\+treeRequestSeq;/.test(source) && (source.match(/if\(requestSeq!==treeRequestSeq\) return;/g) || []).length >= 2 && /e\.path===selPath/.test(source) && !source.includes("treeLoaded=true;\n  diffMode=false"));
+  check("background failures preserve existing content", /if\(d\.error\)\{ if\(!background\) body\.textContent='Error: '\+d\.error; return; \}/.test(source) && /catch\(function\(e\)\{ if\(selPath!==p \|\| diffMode\) return; if\(!background\) body\.textContent='offline'; \}\)/.test(source));
 } finally {
   if (server) await stopServer(server);
   await rm(base, { recursive: true, force: true });
