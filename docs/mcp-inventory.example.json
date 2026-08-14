@@ -1,0 +1,34 @@
+{
+  "version": 1,
+  "connectors": [
+    {
+      "id": "local-coding-agent",
+      "name": "Local Coding Agent",
+      "transport": "http",
+      "endpoint_env": "MCP_MIGRATION_LOCAL_CODING_ENDPOINT",
+      "health_url": "http://127.0.0.1:8787/healthz",
+      "auth": {
+        "type": "bearer",
+        "required": true,
+        "secret_env": "MCP_AUTH_TOKEN"
+      },
+      "notes": [
+        "Use the remote MCP endpoint visible to the new ChatGPT account."
+      ]
+    },
+    {
+      "id": "github-mcp",
+      "name": "GitHub MCP",
+      "transport": "http",
+      "endpoint": "https://example.invalid/mcp",
+      "auth": {
+        "type": "oauth",
+        "required": true,
+        "provider": "GitHub"
+      },
+      "notes": [
+        "Authorize OAuth again on the new ChatGPT account."
+      ]
+    }
+  ]
+}
