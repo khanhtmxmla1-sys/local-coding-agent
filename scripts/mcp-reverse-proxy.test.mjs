@@ -2,6 +2,8 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';
 import { createRequire } from 'node:module';
+import { EventEmitter } from 'node:events';
+import { PassThrough } from 'node:stream';
 
 const require = createRequire(import.meta.url);
 const { createMcpProxy, redactLog, safeForwardHeaders, startChild, validateRouteProcess } = require('./mcp-reverse-proxy.cjs');
@@ -35,6 +37,162 @@ function request(url, { headers = {}, method = 'GET', body } = {}) {
 
 test('proxy fails closed when auth is required but token is missing', () => {
   assert.throws(() => createMcpProxy({ requireAuth: true, authToken: '', routes: {}, secrets: {} }), /auth is required/i);
+});
+
+function openResponse(url, { headers = {}, method = 'GET' } = {}) {
+  return new Promise((resolve, reject) => {
+    const req = http.request(url, { method, headers }, (res) => resolve({ req, res }));
+    req.on('error', reject);
+    req.end();
+  });
+}
+
+function fakeChild() {
+  const child = new EventEmitter();
+  child.stdin = new PassThrough();
+  child.stdout = new PassThrough();
+  child.stderr = new PassThrough();
+  child.kill = () => {
+    queueMicrotask(() => child.emit('close', 0));
+    return true;
+  };
+  return child;
+}
+
+test('no-auth mode is an explicit opt-in and still strips sensitive forwarding headers', async () => {
+  let upstreamAuthorization = null;
+  let upstreamCookie = null;
+  const upstream = http.createServer((req, res) => {
+    upstreamAuthorization = req.headers.authorization || null;
+    upstreamCookie = req.headers.cookie || null;
+    res.end('no-auth-ok');
+  });
+  const upstreamUrl = await listen(upstream);
+  const proxy = createMcpProxy({ requireAuth: false, authToken: '', lcaUrl: upstreamUrl, routes: {}, secrets: {} });
+  const proxyUrl = await listen(proxy.server);
+
+  try {
+    const result = await request(`${proxyUrl}/mcp`, {
+      headers: { Authorization: 'Bearer should-not-forward', Cookie: 'sid=should-not-forward' }
+    });
+    assert.equal(result.status, 200);
+    assert.equal(result.text, 'no-auth-ok');
+    assert.equal(upstreamAuthorization, null);
+    assert.equal(upstreamCookie, null);
+  } finally {
+    await close(proxy.server);
+    await close(upstream);
+  }
+});
+
+test('public proxy rate limit rejects requests after the configured budget', async () => {
+  const proxy = createMcpProxy({
+    requireAuth: false,
+    authToken: '',
+    routes: {},
+    secrets: {},
+    rateLimitPerMinute: 2,
+    rateWindowMs: 60_000
+  });
+  const proxyUrl = await listen(proxy.server);
+
+  try {
+    assert.equal((await request(`${proxyUrl}/missing-1`)).status, 404);
+    assert.equal((await request(`${proxyUrl}/missing-2`)).status, 404);
+    const limited = await request(`${proxyUrl}/missing-3`);
+    assert.equal(limited.status, 429);
+    assert.ok(Number(limited.headers['retry-after']) >= 1);
+  } finally {
+    await close(proxy.server);
+  }
+});
+
+test('SSE child concurrency is globally bounded before another child is spawned', async () => {
+  let spawned = 0;
+  const spawnFn = () => {
+    spawned += 1;
+    return fakeChild();
+  };
+  const routes = {
+    '/memory/sse': { prefix: 'memory', command: 'npx', args: ['-y', '@modelcontextprotocol/server-memory'] }
+  };
+  const proxy = createMcpProxy({
+    requireAuth: false,
+    authToken: '',
+    routes,
+    secrets: {},
+    spawnFn,
+    maxSseConnections: 1,
+    rateLimitPerMinute: 100
+  });
+  const proxyUrl = await listen(proxy.server);
+  let first;
+  let second;
+
+  try {
+    first = await openResponse(`${proxyUrl}/memory/sse`);
+    assert.equal(first.res.statusCode, 200);
+    second = await openResponse(`${proxyUrl}/memory/sse`);
+    assert.equal(second.res.statusCode, 429);
+    assert.equal(spawned, 1);
+  } finally {
+    if (second?.res) second.res.destroy();
+    if (first?.res) first.res.destroy();
+    await close(proxy.server);
+  }
+});
+
+test('outer /mcp POST body limit rejects oversized chunked requests before LCA', async () => {
+  let upstreamRequests = 0;
+  const upstream = http.createServer((req, res) => {
+    upstreamRequests += 1;
+    req.resume();
+    res.end('unexpected-upstream');
+  });
+  const upstreamUrl = await listen(upstream);
+  const proxy = createMcpProxy({
+    requireAuth: false,
+    authToken: '',
+    lcaUrl: upstreamUrl,
+    routes: {},
+    secrets: {},
+    maxLcaBodyBytes: 32,
+    rateLimitPerMinute: 100
+  });
+  const proxyUrl = await listen(proxy.server);
+
+  try {
+    const result = await request(`${proxyUrl}/mcp`, { method: 'POST', body: 'x'.repeat(128) });
+    assert.equal(result.status, 413);
+    assert.equal(upstreamRequests, 0);
+  } finally {
+    await close(proxy.server);
+    await close(upstream);
+  }
+});
+
+test('unauthenticated traffic cannot consume the bearer-mode rate budget', async () => {
+  const upstream = http.createServer((req, res) => res.end('ok'));
+  const upstreamUrl = await listen(upstream);
+  const proxy = createMcpProxy({
+    requireAuth: true,
+    authToken: 'valid-token',
+    lcaUrl: upstreamUrl,
+    routes: {},
+    secrets: {},
+    rateLimitPerMinute: 1
+  });
+  const proxyUrl = await listen(proxy.server);
+
+  try {
+    assert.equal((await request(`${proxyUrl}/mcp`)).status, 401);
+    assert.equal((await request(`${proxyUrl}/mcp`, { headers: { Authorization: 'Bearer wrong' } })).status, 401);
+    assert.equal((await request(`${proxyUrl}/mcp`, { headers: { Authorization: 'Bearer valid-token' } })).status, 200);
+    assert.equal((await request(`${proxyUrl}/mcp`, { headers: { Authorization: 'Bearer valid-token' } })).status, 429);
+  } finally {
+    await close(proxy.server);
+    await close(upstream);
+  }
 });
 
 test('global bearer gate rejects unauthenticated public requests and strips auth before LCA', async () => {
