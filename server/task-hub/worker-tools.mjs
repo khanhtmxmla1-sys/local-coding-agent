@@ -19,7 +19,7 @@ export function registerTaskHubWorkerTools(mcp, { reg, jsonResult, registry, dis
 
   reg(mcp, "task_hub_project_register", {
     title: "Register Task Hub project",
-    description: "Register an immutable project_id to an allowed local workspace. This authority-bearing mapping requires one exact local approval.",
+    description: "Register an immutable project_id to an allowed local workspace. This authority-bearing mapping uses the server's active policy-aware exact-action authorization.",
     inputSchema: {
       id: z.string().min(1).max(128),
       workspace_root: z.string().min(1).max(2000),
