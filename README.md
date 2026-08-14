@@ -102,6 +102,11 @@ node scripts\local-coding-agent.mjs skills doctor
 Open the dashboard at `http://127.0.0.1:8790/ui` to copy the same setup,
 update, diagnose, compact, and resume prompts.
 
+To expose multiple high-privilege MCP routes through a public ngrok URL, use the
+[Public MCP Proxy Security](docs/PUBLIC_MCP_PROXY_SECURITY.md) profile so one
+global bearer gate protects every route and provider credentials stay out of
+source control.
+
 To move MCP connector metadata to another ChatGPT account without exporting
 secret values, use the [MCP Migration Manager](docs/MCP_MIGRATION_MANAGER.md):
 
@@ -141,6 +146,10 @@ node scripts\local-coding-agent.mjs skills doctor
 
 Mở dashboard tại `http://127.0.0.1:8790/ui` để copy cùng các prompt setup,
 update, diagnose, compact và resume.
+
+Nếu bạn công khai nhiều MCP quyền cao qua ngrok, dùng cấu hình
+[Public MCP Proxy Security](docs/PUBLIC_MCP_PROXY_SECURITY.md) để một global
+bearer gate bảo vệ toàn bộ route và không để credential trong source.
 
 Để chuyển danh sách MCP sang tài khoản ChatGPT khác mà không xuất giá trị
 secret, dùng [MCP Migration Manager](docs/MCP_MIGRATION_MANAGER.md):
