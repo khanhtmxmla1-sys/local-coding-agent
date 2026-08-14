@@ -55,6 +55,105 @@ This runs `npm install` in `server/` and creates `tools/`. It does NOT need sudo
 - It is **not a sandbox**. For untrusted workspaces use a VM/container/WSL2.
 - Windows PowerShell 5.1 reads `.ps1` as ANSI — keep scripts ASCII-only.
 
+## ChatGPT / Task Hub operator workflow (mandatory)
+
+When a ChatGPT session is used to work on this repository, treat the following
+Vietnamese operator commands as approval gates with the exact meanings below.
+Do not silently advance to a later gate.
+
+### 1. Audit / planning only
+
+Operator command:
+
+`AUDIT + LÊN PLAN, CHƯA SỬA CODE`
+
+Required behavior:
+
+- Inspect the repository and relevant runtime state using Local Coding Agent / Task Hub.
+- Identify affected files, APIs, schemas, types, routes, shared components,
+  migrations, permissions, generated contracts, and task dependencies.
+- Check active Task Hub work for workspace overlap, project-relative path overlap,
+  semantic overlap, explicit dependencies, and base SHA freshness.
+- Produce a bounded implementation plan with acceptance criteria and expected
+  verification.
+- Do not modify source files.
+- Do not commit, push, create a PR, merge, migrate, deploy, or write to production.
+
+### 2. Implementation approval
+
+Operator command:
+
+`DUYỆT PLAN – TRIỂN KHAI`
+
+Required behavior:
+
+- Create or use one isolated Git worktree and one dedicated branch for the task.
+- Create/use one Task Hub task/project mapping for that writable workspace.
+- Record project-relative `planned_paths`, relevant `semantic_keys`, explicit
+  `depends_on` relationships, acceptance criteria, and the current base SHA.
+- Let Workspace Write Lock, Automatic Overlap Detector, and Base SHA Freshness
+  checks fail closed before writable CODING proceeds.
+- Implement with relevant TDD/tests, then run independent review and security
+  checks.
+- Stop before commit, push, or PR creation.
+
+Core isolation rule: `1 task = 1 worktree = 1 branch = 1 PR`.
+
+### 3. Commit / push / PR approval
+
+Operator command:
+
+`DUYỆT COMMIT + PUSH + TẠO PR`
+
+Required behavior:
+
+- Recheck status, diff, task scope, base freshness, and required tests.
+- Review the staged diff and reject unrelated changes or blocking findings.
+- Commit only the approved task scope, push the dedicated branch, and create one
+  PR against `main`.
+- Wait for CI/review and report branch, commit SHA, PR number, tests, CI state,
+  and review findings.
+- Do not merge. Merge requires a separate operator approval.
+
+The operator may append a task label to the command, for example
+`DUYỆT COMMIT + PUSH + TẠO PR DASHBOARD GIÁO VIÊN`; the approval still applies
+only to that bounded task.
+
+### 4. Merge / verify / cleanup approval
+
+Operator command:
+
+`DUYỆT MERGE PR #X + VERIFY + CLEANUP`
+
+Required behavior before merge:
+
+- Refresh the current base branch and verify the exact PR head SHA.
+- Enforce Base SHA Freshness Gate and recheck overlap/dependency evidence.
+- Require green CI and any required review/security gates.
+- If `main` advanced since verification, sync the feature branch with latest
+  `main`, inspect textual and semantic conflicts, rerun tests/review/security,
+  and require fresh CI before merge.
+
+Required behavior after merge:
+
+- Record and verify the exact merge SHA on `main`.
+- Run required post-merge smoke/E2E checks and confirm `HEAD == origin/main`.
+- Only after successful verification remove the task worktree and delete the
+  local and remote feature branches.
+- If post-merge verification fails, keep debugging evidence and stop cleanup.
+
+### Parallel ChatGPT sessions
+
+Multiple ChatGPT tabs may audit, plan, review, or code at the same time, but the
+same approval protocol applies independently to each task. Read-only work may
+share a repo; writable CODING must use isolated worktrees. Related integration
+is serialized: **CODING may run in parallel; integration / merge must be
+serialized.** Never treat an old green CI result as current after `main` changes.
+
+Automatic guards are safety controls, not substitutes for task understanding.
+The Manager must still provide accurate `planned_paths`, `semantic_keys`,
+`depends_on`, scope, and acceptance criteria.
+
 ## Parallel task delivery rules (mandatory)
 
 These rules apply whenever one project is being handled from multiple ChatGPT tabs,
