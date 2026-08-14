@@ -55,6 +55,46 @@ This runs `npm install` in `server/` and creates `tools/`. It does NOT need sudo
 - It is **not a sandbox**. For untrusted workspaces use a VM/container/WSL2.
 - Windows PowerShell 5.1 reads `.ps1` as ANSI — keep scripts ASCII-only.
 
+## Parallel task delivery rules (mandatory)
+
+These rules apply whenever one project is being handled from multiple ChatGPT tabs,
+Task Hub tasks, or coding workers at the same time.
+
+1. **Read-only work may run in parallel on the same repo.** Audits, planning, and
+   reviewer tasks may share a source tree as long as they do not edit files.
+2. **Concurrent CODING work must be isolated.** Every writable task gets its own
+   Git worktree, branch, Task Hub task/project mapping, and later its own PR. Never
+   let two CODING workers write to the same working tree or writable root.
+3. **One task = one worktree = one branch = one PR.** Record the task's base SHA
+   before coding and keep its scoped/planned touched paths as evidence.
+4. **Detect overlap before dispatch.** Compare active tasks for exact file/path
+   overlap and for semantic dependencies such as shared APIs, schemas, types,
+   migrations, config, reusable components, or generated contracts. If one task
+   depends on another, encode `depends_on` or serialize them instead of pretending
+   they are independent.
+5. **Coding may be parallel; merge is serialized.** Only one related PR should be
+   integrated into `main` at a time. After PR A merges, every related PR B that was
+   verified against the old base must sync with the new `main` before it can merge.
+6. **A changed base invalidates merge readiness.** Rebase or merge the latest
+   `main` into the downstream branch, resolve any conflicts, then rerun the
+   relevant tests, independent reviewer, security checks, and CI. A previously
+   green PR is not automatically still merge-ready after `main` changes.
+7. **Do not resolve conflicts mechanically.** Never choose `ours`/`theirs` just to
+   make Git clean. Preserve the intent and acceptance criteria of both tasks, and
+   explicitly review the combined behavior.
+8. **Check semantic conflicts even when Git reports none.** API signature changes,
+   shared state, schemas, permissions, routes, generated files, and cross-cutting
+   UI components can break another branch without producing a textual conflict.
+9. **High-impact actions remain gated.** Commit, push, PR creation, merge,
+   migration, deploy, and production writes still require their normal approval
+   and verification gates; parallel work never bypasses them.
+10. **Cleanup happens only after integration verification.** After merge, verify
+    the exact `main` SHA and required smoke/E2E checks before deleting the feature
+    branch/worktree.
+
+Until Task Hub has an automatic workspace-write lock and overlap detector, the
+Manager must enforce these rules before dispatching writable workers.
+
 ## Safety
 Read `SECURITY.md`. Prompt injection is real; only connect trusted workspaces.
 Never expose the server on a public tunnel without `MCP_AUTH_TOKEN`.
