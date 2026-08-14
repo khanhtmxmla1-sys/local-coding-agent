@@ -102,6 +102,14 @@ node scripts\local-coding-agent.mjs skills doctor
 Open the dashboard at `http://127.0.0.1:8790/ui` to copy the same setup,
 update, diagnose, compact, and resume prompts.
 
+To move MCP connector metadata to another ChatGPT account without exporting
+secret values, use the [MCP Migration Manager](docs/MCP_MIGRATION_MANAGER.md):
+
+```powershell
+node scripts\mcp-migration-manager.mjs init
+node scripts\mcp-migration-manager.mjs audit
+```
+
 ### Tiếng Việt
 
 Dùng phần này khi bạn muốn ChatGPT, Claude Code, Codex, Cursor hoặc một AI coding
@@ -133,6 +141,14 @@ node scripts\local-coding-agent.mjs skills doctor
 
 Mở dashboard tại `http://127.0.0.1:8790/ui` để copy cùng các prompt setup,
 update, diagnose, compact và resume.
+
+Để chuyển danh sách MCP sang tài khoản ChatGPT khác mà không xuất giá trị
+secret, dùng [MCP Migration Manager](docs/MCP_MIGRATION_MANAGER.md):
+
+```powershell
+node scripts\mcp-migration-manager.mjs init
+node scripts\mcp-migration-manager.mjs audit
+```
 
 ---
 

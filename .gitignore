@@ -20,6 +20,9 @@ support-report.txt
 network-doctor-report.txt
 setup-wizard-report.txt
 
+mcp-inventory.local.json
+mcp-migration-output/
+
 # ---- Node ----
 node_modules/
 server/data/

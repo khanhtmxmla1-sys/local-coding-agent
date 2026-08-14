@@ -61,6 +61,8 @@ jobs:
           node ../scripts/release-public-gate.mjs
           npm run test:context
           node --test ../scripts/network-doctor.test.mjs
+          node --test ../scripts/mcp-migration-manager.test.mjs
+          node --check ../scripts/mcp-migration-manager.mjs
           node --check ../scripts/validate-skills.mjs
           node --check ../scripts/support-report.mjs
           node ../scripts/local-coding-agent.mjs --help
