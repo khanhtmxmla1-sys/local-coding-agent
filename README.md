@@ -104,7 +104,8 @@ update, diagnose, compact, and resume prompts.
 
 To expose multiple high-privilege MCP routes through a public ngrok URL, use the
 [Public MCP Proxy Security](docs/PUBLIC_MCP_PROXY_SECURITY.md) profile so one
-global bearer gate protects every route and provider credentials stay out of
+global bearer gate protects every route by default; explicit No Auth remains an opt-in
+runtime mode with rate/concurrency/body guards, while provider credentials stay out of
 source control.
 
 To move MCP connector metadata to another ChatGPT account without exporting
@@ -149,7 +150,8 @@ update, diagnose, compact và resume.
 
 Nếu bạn công khai nhiều MCP quyền cao qua ngrok, dùng cấu hình
 [Public MCP Proxy Security](docs/PUBLIC_MCP_PROXY_SECURITY.md) để một global
-bearer gate bảo vệ toàn bộ route và không để credential trong source.
+bearer gate bảo vệ toàn bộ route theo mặc định; No Auth chỉ là chế độ runtime opt-in
+có rate/concurrency/body guard, và credential không nằm trong source.
 
 Để chuyển danh sách MCP sang tài khoản ChatGPT khác mà không xuất giá trị
 secret, dùng [MCP Migration Manager](docs/MCP_MIGRATION_MANAGER.md):
