@@ -33,6 +33,12 @@ test("task model applies safe defaults and default-deny permissions", () => {
   assert.equal(task.status, TASK_STATUSES.DRAFT);
   assert.equal(task.priority, 50);
   assert.deepEqual(task.depends_on, []);
+  assert.deepEqual(task.planned_paths, []);
+  assert.deepEqual(task.semantic_keys, []);
+  assert.equal(task.base_ref, "origin/main");
+  assert.equal(task.repository_key, null);
+  assert.equal(task.workspace_lock_key, null);
+  assert.equal(task.parallel_guard.requires_revalidation, false);
   assert.equal(task.permissions.commit, false);
   assert.equal(task.permissions.push, false);
   assert.equal(task.permissions.merge, false);
@@ -49,6 +55,8 @@ test("task model rejects invalid role/status, self dependency, duplicate depende
   assert.throws(() => createTaskRecord(baseTask({ depends_on: ["task-a"] }), { now: NOW }), /self/i);
   assert.throws(() => createTaskRecord(baseTask({ depends_on: ["task-b", "task-b"] }), { now: NOW }), /duplicate/i);
   assert.throws(() => createTaskRecord({ ...baseTask(), unexpected_field: "should-not-persist" }, { now: NOW }), /unknown/i);
+  assert.throws(() => createTaskRecord(baseTask({ planned_paths: ["C:\\repo\\src\\shared.ts"] }), { now: NOW }), /project-relative|absolute/i);
+  assert.throws(() => createTaskRecord(baseTask({ planned_paths: ["../outside.ts"] }), { now: NOW }), /inside the project/i);
 });
 
 test("state transitions allow the bounded happy path and reject unsafe skips", () => {

@@ -14,6 +14,8 @@ function publicTask(task) {
   if (!task) return null;
   const copy = JSON.parse(JSON.stringify(task));
   delete copy.lease_proof;
+  delete copy.workspace_lock_key;
+  delete copy.repository_key;
   return copy;
 }
 
@@ -46,7 +48,7 @@ export function buildWorkerPrompt(task) {
 }
 
 export class TaskHubDispatcher {
-  constructor({ store, registry, agentManager, resolveWorkspace, providerAvailable, idFactory = randomUUID, maxRuntimeMs = 300_000, leaseMs = 360_000 } = {}) {
+  constructor({ store, registry, agentManager, resolveWorkspace, providerAvailable, prepareClaimContext = null, idFactory = randomUUID, maxRuntimeMs = 300_000, leaseMs = 360_000 } = {}) {
     if (!store || !registry || !agentManager) throw new Error("TaskHubDispatcher requires store, registry, and agentManager.");
     if (typeof resolveWorkspace !== "function") throw new Error("TaskHubDispatcher requires resolveWorkspace().");
     if (typeof providerAvailable !== "function") throw new Error("TaskHubDispatcher requires providerAvailable().");
@@ -58,6 +60,7 @@ export class TaskHubDispatcher {
     this.agentManager = agentManager;
     this.resolveWorkspace = resolveWorkspace;
     this.providerAvailable = providerAvailable;
+    this.prepareClaimContext = typeof prepareClaimContext === "function" ? prepareClaimContext : null;
     this.idFactory = idFactory;
     this.maxRuntimeMs = maxRuntimeMs;
     this.leaseMs = leaseMs;
@@ -89,7 +92,8 @@ export class TaskHubDispatcher {
     if (task.role === TASK_ROLES.CODING && workspace.can_write !== true) throw new Error(`Project ${project.id} workspace is not writable for the coding adapter.`);
 
     const workerId = `taskhub-${String(this.idFactory())}`.slice(0, 200);
-    const claimed = await this.store.claimTask(task.id, workerId, this.leaseMs);
+    const guardContext = this.prepareClaimContext ? await this.prepareClaimContext(task, project, workspace) : null;
+    const claimed = await this.store.claimTask(task.id, workerId, this.leaseMs, guardContext);
     let spawned;
     try {
       spawned = await this.agentManager.spawn({

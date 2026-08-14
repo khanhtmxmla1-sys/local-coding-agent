@@ -153,14 +153,14 @@ Task A -> worktree A -> branch A -> PR A
 Task B -> worktree B -> branch B -> PR B
 ```
 
-Do not let two active CODING workers claim the same working tree or writable root. The Manager should record at least `workspace_root`, `branch`, and `base_sha` as task evidence before dispatch. A future runtime workspace-lock table may enforce this automatically; until then the Manager must enforce it as a hard precondition.
+Do not let two active CODING workers claim the same working tree or writable root. Task Hub now enforces this inside the durable claim transaction: the resolved writable workspace is converted to a private `workspace_lock_key`, and a second active CODING claim for the same key fails before a lease is issued. The raw workspace lock key is internal and is not returned by public task tools.
 
 ### Overlap and dependency detection
-Before dispatching a writable task, compare it with active sibling tasks. Detect both:
-- textual/path overlap: same file, directory, generated artifact, migration series, or lock/config file;
-- semantic overlap: one task changes an API, schema, type, permission rule, route, shared state, reusable component, generated contract, or behavior consumed by another task.
+Before dispatching a writable task, Task Hub compares it with active CODING siblings that belong to the same Git repository identity. Linked worktrees share a repository identity derived from Git's common directory while retaining different workspace lock keys. Detection uses:
+- textual/path overlap: `planned_paths` plus path-like literals inferred from `scope_in`; exact or ancestor/descendant path overlap is a hard conflict and blocks the second claim;
+- semantic overlap: `semantic_keys` plus structured literals such as `api:`, `route:`, `schema:`, `type:`, `component:`, `migration:`, `config:`, `state:`, `contract:`, and `permission:`. Semantic-only overlap may run in separate worktrees but is persisted as `parallel_guard.requires_revalidation=true`.
 
-If B requires A's output, encode `B depends_on A`. If the work cannot be made independent safely, serialize it rather than forcing parallel execution.
+If B requires A's output, still encode `B depends_on A`. Automatic overlap detection is conservative and cannot replace explicit dependency modeling.
 
 ### Merge serialization
 Coding may happen in parallel, but related integration is serialized. After PR A merges, PR B is not allowed to merge merely because it was green earlier. If B's verification base is older than current `main`, its previous merge readiness is stale.
@@ -183,7 +183,7 @@ B syncs latest main
 Never resolve a conflict mechanically with `ours` or `theirs`. The combined result must preserve the intent and acceptance criteria of both tasks.
 
 ### Freshness rule
-For related writable tasks, `MERGE_READY` is valid only for the exact verified base/head relationship. A change to `main` after verification must invalidate merge readiness until integration freshness is re-established. Store or report the verified base SHA and PR head SHA so this can be proven rather than inferred.
+For related writable tasks, `MERGE_READY` is valid only for the exact verified base/head relationship. Task Hub's Base SHA Freshness Gate refreshes the configured base ref (default `origin/main`) before entering or advancing from `MERGE_READY`, verifies that the refreshed base is an ancestor of the task branch HEAD, and records `verified_base_sha` plus `verified_head_sha`. If either SHA changes afterward, the next gated transition fails until the branch is synchronized and verification evidence is re-established. The freshness check runs before merge approval is consumed, so a stale task cannot waste or bypass an approval.
 
 ### Cleanup rule
 Delete feature branches and worktrees only after the merged `main` SHA is known and required post-merge smoke/E2E verification succeeds. Failed post-merge verification blocks cleanup that would destroy useful debugging evidence.

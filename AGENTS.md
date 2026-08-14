@@ -92,8 +92,9 @@ Task Hub tasks, or coding workers at the same time.
     the exact `main` SHA and required smoke/E2E checks before deleting the feature
     branch/worktree.
 
-Until Task Hub has an automatic workspace-write lock and overlap detector, the
-Manager must enforce these rules before dispatching writable workers.
+Task Hub enforces a durable workspace-write lock and automatic overlap check at CODING claim time. The
+Manager must still provide accurate project-relative `planned_paths`, `semantic_keys`, dependencies,
+and acceptance criteria so relationships that cannot be inferred mechanically remain visible.
 
 ## Safety
 Read `SECURITY.md`. Prompt injection is real; only connect trusted workspaces.

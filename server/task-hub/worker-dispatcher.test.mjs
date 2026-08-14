@@ -39,12 +39,12 @@ class FakeAgentManager {
   }
 }
 
-async function harness({ role = "CODING", permissions = { read: true, edit: true, test: true }, allowed_roles = ["CODING", "REVIEWER"] } = {}) {
+async function harness({ role = "CODING", permissions = { read: true, edit: true, test: true }, allowed_roles = ["CODING", "REVIEWER"], enforceParallelGuards = false, prepareClaimContext = null } = {}) {
   const storeDir = await mkdtemp(path.join(os.tmpdir(), "lca-dispatch-store-"));
   const registryDir = await mkdtemp(path.join(os.tmpdir(), "lca-dispatch-registry-"));
   const workspace = await mkdtemp(path.join(os.tmpdir(), "lca-dispatch-workspace-"));
   let leaseNo = 0;
-  const store = new TaskHubStore({ dir: storeDir, now: () => NOW, idFactory: () => `lease-${++leaseNo}` });
+  const store = new TaskHubStore({ dir: storeDir, now: () => NOW, idFactory: () => `lease-${++leaseNo}`, enforceParallelGuards });
   const registry = new ProjectRegistry({ dir: registryDir, now: () => NOW });
   await registry.register({ id: "tohieuquiz", workspace_root: workspace, allowed_roles });
   await store.createTask({ id: "task-1", project_id: "tohieuquiz", goal: "Do bounded work", role, status: "READY", permissions });
@@ -55,6 +55,7 @@ async function harness({ role = "CODING", permissions = { read: true, edit: true
     registry,
     agentManager,
     providerAvailable: () => true,
+    prepareClaimContext,
     resolveWorkspace: async (project, task) => ({
       resolved: path.resolve(project.workspace_root),
       can_write: task.role === "CODING",
@@ -149,6 +150,30 @@ test("dispatcher rejects unknown project, missing permissions and unavailable pr
     h.dispatcher.providerAvailable = () => false;
     await assert.rejects(() => h.dispatcher.dispatch("task-provider"), /codex.*unavailable/i);
     assert.equal((await h.store.getTask("task-provider")).status, "READY");
+  } finally { await cleanup(h); }
+});
+
+test("dispatcher passes automatic parallel guard context into durable CODING claim", async () => {
+  const guard = {
+    workspaceLockKey: "workspace-test",
+    repositoryKey: "repo-test",
+    observedBaseSha: "a".repeat(40),
+    observedHeadSha: "b".repeat(40),
+    baseIsAncestor: true
+  };
+  const h = await harness({ enforceParallelGuards: true, prepareClaimContext: async () => guard });
+  try {
+    const dispatched = await h.dispatcher.dispatch("task-1");
+    assert.equal(dispatched.task.status, "RUNNING");
+    assert.equal("workspace_lock_key" in dispatched.task, false);
+    assert.equal("repository_key" in dispatched.task, false);
+    const persisted = await h.store.getTask("task-1");
+    assert.equal(persisted.repository_key, "repo-test");
+    assert.equal(persisted.workspace_lock_key, "workspace-test");
+    assert.equal(persisted.base_sha, guard.observedBaseSha);
+    assert.equal(persisted.dispatch_head_sha, guard.observedHeadSha);
+    h.agentManager.finish(dispatched.local_agent_id, { summary: "guarded worker complete" });
+    await h.dispatcher.settle("task-1");
   } finally { await cleanup(h); }
 });
 
