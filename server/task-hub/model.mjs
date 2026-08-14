@@ -1,6 +1,8 @@
 // Local Coding Agent - AI Task Hub core model
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
+import path from "node:path";
+
 export const TASK_ROLES = Object.freeze({
   MANAGER: "MANAGER",
   CODING: "CODING",
@@ -39,7 +41,7 @@ export const HIGH_IMPACT_PERMISSIONS = Object.freeze([
 ]);
 
 const TASK_INPUT_FIELDS = new Set([
-  "id", "parent_id", "project_id", "title", "goal", "role", "status", "priority", "depends_on", "scope_in", "scope_out", "acceptance_criteria", "permissions", "result_summary", "blocked_reason"
+  "id", "parent_id", "project_id", "title", "goal", "role", "status", "priority", "depends_on", "scope_in", "scope_out", "acceptance_criteria", "permissions", "result_summary", "blocked_reason", "planned_paths", "semantic_keys", "base_ref"
 ]);
 const ROLE_VALUES = new Set(Object.values(TASK_ROLES));
 const STATUS_VALUES = new Set(Object.values(TASK_STATUSES));
@@ -87,6 +89,20 @@ function stringArray(value, label, { maxItems = 100, maxItemLength = 1000 } = {}
     return trimmed;
   });
 }
+function plannedPathArray(value) {
+  return stringArray(value, "planned_paths", { maxItems: 200, maxItemLength: 1000 }).map((item, index) => {
+    const slashPath = item.replace(/\\/g, "/");
+    if (/^[A-Za-z]:\//.test(slashPath) || slashPath.startsWith("/") || slashPath.startsWith("//")) {
+      throw new Error(`planned_paths[${index}] must be project-relative, not absolute.`);
+    }
+    const normalized = path.posix.normalize(slashPath);
+    if (normalized === "." || normalized === ".." || normalized.startsWith("../")) {
+      throw new Error(`planned_paths[${index}] must stay inside the project.`);
+    }
+    return normalized.replace(/^\.\//, "");
+  });
+}
+
 function normalizePermissions(input) {
   if (input == null) input = {};
   assertPlainObject(input, "permissions");
@@ -127,9 +143,19 @@ export function createTaskRecord(input, { now = Date.now() } = {}) {
     scope_in: stringArray(input.scope_in, "scope_in"),
     scope_out: stringArray(input.scope_out, "scope_out"),
     acceptance_criteria: stringArray(input.acceptance_criteria, "acceptance_criteria"),
+    planned_paths: plannedPathArray(input.planned_paths),
+    semantic_keys: stringArray(input.semantic_keys, "semantic_keys", { maxItems: 200, maxItemLength: 300 }),
+    base_ref: boundedString(input.base_ref ?? "origin/main", "base_ref", { required: true, max: 200 }),
     permissions: normalizePermissions(input.permissions),
     result_summary: boundedString(input.result_summary, "result_summary", { max: 8000 }),
     blocked_reason: boundedString(input.blocked_reason, "blocked_reason", { max: 2000 }),
+    repository_key: null,
+    workspace_lock_key: null,
+    base_sha: null,
+    dispatch_head_sha: null,
+    verified_base_sha: null,
+    verified_head_sha: null,
+    parallel_guard: { checked_at: null, requires_revalidation: false, overlaps: [] },
     lease_owner: null, lease_proof: null, lease_expires_at: null,
     created_at: timestamp, updated_at: timestamp, version: 1
   };

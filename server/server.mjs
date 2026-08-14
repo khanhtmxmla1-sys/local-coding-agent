@@ -51,6 +51,7 @@ import { registerTaskHubTools } from "./task-hub/tools.mjs";
 import { ProjectRegistry } from "./task-hub/project-registry.mjs";
 import { TaskHubDispatcher } from "./task-hub/worker-dispatcher.mjs";
 import { registerTaskHubWorkerTools } from "./task-hub/worker-tools.mjs";
+import { inspectGitRepository } from "./task-hub/repository-state.mjs";
 
 // ----------------------------------------------------------------------------
 // Configuration (all overridable via environment variables)
@@ -194,7 +195,7 @@ const TASK_HUB_DIR = path.resolve(process.env.AGENT_TASK_HUB_DIR || path.join(PR
 if (ROOTS.some((root) => isPathInside(canonicalizePath(TASK_HUB_DIR), canonicalizePath(root)))) {
   throw new Error("Task Hub storage must be outside every authorized workspace root. Set AGENT_TASK_HUB_DIR to a private operator-owned path.");
 }
-const TASK_HUB_STORE = new TaskHubStore({ dir: TASK_HUB_DIR });
+const TASK_HUB_STORE = new TaskHubStore({ dir: TASK_HUB_DIR, enforceParallelGuards: true });
 const TASK_HUB_PROJECTS_DIR = path.resolve(process.env.AGENT_TASK_HUB_PROJECTS_DIR || path.join(PRIVATE_STATE_DIR, "task-hub-projects"));
 if (ROOTS.some((root) => isPathInside(canonicalizePath(TASK_HUB_PROJECTS_DIR), canonicalizePath(root)))) {
   throw new Error("Task Hub project registry must be outside every authorized workspace root. Set AGENT_TASK_HUB_PROJECTS_DIR to a private operator-owned path.");
@@ -343,6 +344,7 @@ if (PREVIEW_ENABLED) {
     registry: TASK_HUB_PROJECT_REGISTRY,
     agentManager,
     resolveWorkspace: resolveTaskHubDispatchWorkspace,
+    prepareClaimContext: prepareTaskHubClaimContext,
     providerAvailable: (name) => detectProviders().some((provider) => provider.name === name && provider.available),
     maxRuntimeMs: boundedNumber(process.env.AGENT_TASK_HUB_WORKER_MAX_RUNTIME_MS, 300000, 1000, 600000),
     leaseMs: boundedNumber(process.env.AGENT_TASK_HUB_WORKER_LEASE_MS, 360000, 2000, 3600000)
@@ -375,6 +377,61 @@ async function resolveTaskHubDispatchWorkspace(project, task) {
     permission_profile: PERMISSION_RESOLVER.summary().name,
     permission_roots: root ? [{ path: project.workspace_root, preset: root.preset, filesystem: root.filesystem, commands: root.commands }] : []
   };
+}
+
+async function prepareTaskHubClaimContext(task, project = null, workspace = null) {
+  if (task?.role !== "CODING" || task?.permissions?.edit !== true) return null;
+  if (!task?.project_id) return null;
+  const resolvedProject = project || await TASK_HUB_PROJECT_REGISTRY.get(task.project_id);
+  if (!resolvedProject) throw new Error(`Project ${task.project_id} is not registered.`);
+  const resolvedWorkspace = workspace || await resolveTaskHubDispatchWorkspace(resolvedProject, task);
+  const state = await inspectGitRepository(resolvedWorkspace.resolved, { baseRef: task.base_ref || "origin/main", refreshBase: false });
+  return {
+    workspaceLockKey: state.workspace_lock_key,
+    repositoryKey: state.repository_key,
+    observedBaseSha: state.base_sha,
+    observedHeadSha: state.head_sha,
+    baseIsAncestor: state.base_is_ancestor,
+    isGitRepo: state.is_git_repo
+  };
+}
+
+async function checkTaskHubFreshness(task, { refreshBase = false, requireVerified = false } = {}) {
+  if (task?.role !== "CODING") return { fresh: false, reason: "merge freshness is supported only for CODING tasks", base_sha: null, head_sha: null, base_is_ancestor: null };
+  if (!task?.project_id) return { fresh: false, reason: "task has no project_id", base_sha: null, head_sha: null, base_is_ancestor: null };
+  const project = await TASK_HUB_PROJECT_REGISTRY.get(task.project_id);
+  if (!project) return { fresh: false, reason: `project ${task.project_id} is not registered`, base_sha: null, head_sha: null, base_is_ancestor: null };
+  const resolved = await resolveTaskHubDispatchWorkspace(project, task);
+  const state = await inspectGitRepository(resolved.resolved, { baseRef: task.base_ref || "origin/main", refreshBase });
+  const result = { ...state, fresh: false, reason: null };
+  if (!state.is_git_repo) {
+    result.reason = "project workspace is not a Git repository";
+    return result;
+  }
+  if (!state.base_sha || !state.head_sha) {
+    result.reason = `could not resolve ${state.base_ref} or HEAD`;
+    return result;
+  }
+  if (state.base_is_ancestor !== true) {
+    result.reason = `${state.base_ref} is not an ancestor of the task branch HEAD; sync/rebase is required`;
+    return result;
+  }
+  if (requireVerified) {
+    if (!task.verified_base_sha || !task.verified_head_sha) {
+      result.reason = "MERGE_READY has no verified base/head SHA evidence";
+      return result;
+    }
+    if (task.verified_base_sha !== state.base_sha) {
+      result.reason = `verified base SHA changed from ${task.verified_base_sha} to ${state.base_sha}`;
+      return result;
+    }
+    if (task.verified_head_sha !== state.head_sha) {
+      result.reason = `verified head SHA changed from ${task.verified_head_sha} to ${state.head_sha}`;
+      return result;
+    }
+  }
+  result.fresh = true;
+  return result;
 }
 
 let metrics = loadMetrics();
@@ -651,7 +708,14 @@ function createMcpServer() {
   registerReviewTools(mcp);       // v2.4
   registerPlannerTools(mcp);      // v2.5
   registerPolicyTools(mcp);       // v2.6
-  registerTaskHubTools(mcp, { reg, store: TASK_HUB_STORE, jsonResult, authorizeAction: consumeExactApproval });
+  registerTaskHubTools(mcp, {
+    reg,
+    store: TASK_HUB_STORE,
+    jsonResult,
+    authorizeAction: consumeExactApproval,
+    checkFreshness: checkTaskHubFreshness,
+    prepareClaimContext: prepareTaskHubClaimContext
+  });
   registerTaskHubWorkerTools(mcp, {
     reg,
     jsonResult,

@@ -14,6 +14,7 @@ import {
   hasHighImpactPermission
 } from "./model.mjs";
 import { leaseProof } from "./lease-proof.mjs";
+import { taskOverlapEvidence } from "./parallel-guards.mjs";
 
 const STORE_LOCKS = new Map();
 const FILE_LOCK_RETRY_MS = 15;
@@ -92,7 +93,7 @@ function assertLeaseDuration(leaseMs) {
 }
 
 export class TaskHubStore {
-  constructor({ dir, now = Date.now, idFactory = randomUUID } = {}) {
+  constructor({ dir, now = Date.now, idFactory = randomUUID, enforceParallelGuards = false } = {}) {
     if (typeof dir !== "string" || !dir.trim()) throw new Error("TaskHubStore dir is required.");
     if (typeof now !== "function") throw new Error("TaskHubStore now must be a function.");
     if (typeof idFactory !== "function") throw new Error("TaskHubStore idFactory must be a function.");
@@ -102,6 +103,7 @@ export class TaskHubStore {
     this.lockKey = process.platform === "win32" ? this.dir.toLowerCase() : this.dir;
     this.now = now;
     this.idFactory = idFactory;
+    this.enforceParallelGuards = enforceParallelGuards === true;
   }
 
   taskPath(taskId) {
@@ -172,6 +174,17 @@ export class TaskHubStore {
     return clone(tasks);
   }
 
+  async listTasksUnlocked() {
+    await this.ensureDir();
+    const names = (await readdir(this.tasksDir)).filter((name) => name.endsWith(".json")).sort();
+    const tasks = [];
+    for (const name of names) {
+      const task = await this.readTaskUnlocked(name.slice(0, -5));
+      if (task) tasks.push(task);
+    }
+    return tasks;
+  }
+
   async loadDependenciesUnlocked(task) {
     const byId = new Map();
     for (const dependencyId of task.depends_on || []) {
@@ -181,7 +194,7 @@ export class TaskHubStore {
     return byId;
   }
 
-  async claimTask(taskId, workerId, leaseMs) {
+  async claimTask(taskId, workerId, leaseMs, guardContext = null) {
     workerId = assertWorkerId(workerId);
     leaseMs = assertLeaseDuration(leaseMs);
     return this.withWriteLock(async () => {
@@ -203,6 +216,52 @@ export class TaskHubStore {
       const dependencies = await this.loadDependenciesUnlocked(task);
       if (!dependenciesSatisfied(task, dependencies)) {
         throw new Error(`Task ${taskId} dependencies are not DONE.`);
+      }
+
+      const guardedCoding = task.role === "CODING" && task.permissions?.edit === true;
+      if (guardedCoding && this.enforceParallelGuards) {
+        if (!task.project_id) throw new Error(`Task ${taskId} writable CODING requires project_id when parallel guards are enabled.`);
+        if (!guardContext || typeof guardContext !== "object") {
+          throw new Error(`Task ${taskId} requires Task Hub parallel guard context before CODING claim.`);
+        }
+        const workspaceLockKey = String(guardContext.workspaceLockKey || "").trim();
+        const repositoryKey = String(guardContext.repositoryKey || "").trim();
+        if (!workspaceLockKey || !repositoryKey) {
+          throw new Error(`Task ${taskId} requires workspace/repository guard keys before CODING claim.`);
+        }
+        if (guardContext.baseIsAncestor === false) {
+          throw new Error(`Task ${taskId} base is stale; sync the worktree with the latest ${task.base_ref || "main"} before CODING dispatch.`);
+        }
+
+        const overlaps = [];
+        for (const other of await this.listTasksUnlocked()) {
+          if (other.id === task.id || other.role !== "CODING" || other.permissions?.edit !== true) continue;
+          const activeWrite = other.status === TASK_STATUSES.RUNNING && Number(other.lease_expires_at || 0) > now;
+          const settled = other.status === TASK_STATUSES.DONE || other.status === TASK_STATUSES.CANCELLED;
+          if (activeWrite && other.workspace_lock_key && other.workspace_lock_key === workspaceLockKey) {
+            throw new Error(`Workspace write lock is held by active task ${other.id}.`);
+          }
+          if (!settled && other.repository_key && other.repository_key === repositoryKey) {
+            const evidence = taskOverlapEvidence(task, other);
+            if (activeWrite && evidence.hard_conflict) {
+              const paths = evidence.path_matches.join(", ") || "planned paths";
+              throw new Error(`Task ${taskId} has a hard path overlap with active task ${other.id}: ${paths}.`);
+            }
+            if (evidence.requires_revalidation) overlaps.push(evidence);
+          }
+        }
+
+        task.repository_key = repositoryKey;
+        task.workspace_lock_key = workspaceLockKey;
+        task.base_sha = guardContext.observedBaseSha || task.base_sha || null;
+        task.dispatch_head_sha = guardContext.observedHeadSha || null;
+        task.verified_base_sha = null;
+        task.verified_head_sha = null;
+        task.parallel_guard = {
+          checked_at: now,
+          requires_revalidation: overlaps.length > 0,
+          overlaps
+        };
       }
 
       const leaseId = String(this.idFactory());
@@ -285,7 +344,7 @@ export class TaskHubStore {
     });
   }
 
-  async transitionTask(taskId, to, { expectedVersion, blockedReason = null } = {}) {
+  async transitionTask(taskId, to, { expectedVersion, blockedReason = null, freshness = null } = {}) {
     return this.withWriteLock(async () => {
       const task = await this.readTaskUnlocked(taskId);
       if (!task) throw new Error(`Task ${taskId} not found.`);
@@ -305,6 +364,10 @@ export class TaskHubStore {
       if (!Number.isFinite(now)) throw new Error("TaskHubStore clock returned an invalid value.");
       task.status = to;
       task.blocked_reason = to === TASK_STATUSES.BLOCKED ? String(blockedReason || "").trim() || null : null;
+      if (to === TASK_STATUSES.MERGE_READY && freshness) {
+        task.verified_base_sha = freshness.base_sha || null;
+        task.verified_head_sha = freshness.head_sha || null;
+      }
       task.updated_at = now;
       task.version = Number(task.version || 0) + 1;
       await this.writeTaskUnlocked(task);

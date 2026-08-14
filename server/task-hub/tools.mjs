@@ -18,6 +18,8 @@ export function publicTask(task) {
   if (!task) return null;
   const copy = JSON.parse(JSON.stringify(task));
   delete copy.lease_proof;
+  delete copy.workspace_lock_key;
+  delete copy.repository_key;
   return copy;
 }
 
@@ -38,7 +40,7 @@ function transitionNeedsApproval(task, to) {
   return (GATE_PERMISSIONS[to] || []).length > 0;
 }
 
-export function registerTaskHubTools(mcp, { reg, store, jsonResult, authorizeAction } = {}) {
+export function registerTaskHubTools(mcp, { reg, store, jsonResult, authorizeAction, checkFreshness = null, prepareClaimContext = null } = {}) {
   if (typeof reg !== "function") throw new Error("Task Hub tool registration requires reg().");
   if (!store) throw new Error("Task Hub tool registration requires a store.");
   if (typeof jsonResult !== "function") throw new Error("Task Hub tool registration requires jsonResult().");
@@ -52,13 +54,16 @@ export function registerTaskHubTools(mcp, { reg, store, jsonResult, authorizeAct
       title: z.string().max(300).optional(), goal: z.string().min(1).max(4000), role: z.enum(ROLE_VALUES).optional(),
       priority: z.number().int().min(0).max(100).optional(), depends_on: z.array(z.string().min(1).max(128)).max(100).optional(),
       scope_in: z.array(z.string().min(1).max(1000)).max(100).optional(), scope_out: z.array(z.string().min(1).max(1000)).max(100).optional(),
-      acceptance_criteria: z.array(z.string().min(1).max(1000)).max(100).optional(), permissions: z.object(PERMISSION_SHAPE).optional()
+      acceptance_criteria: z.array(z.string().min(1).max(1000)).max(100).optional(),
+      planned_paths: z.array(z.string().min(1).max(1000)).max(200).optional(), semantic_keys: z.array(z.string().min(1).max(300)).max(200).optional(),
+      base_ref: z.string().min(1).max(200).optional(), permissions: z.object(PERMISSION_SHAPE).optional()
     }
   }, async (args) => {
     const task = await store.createTask({
       id: args.id, parent_id: args.parent_id, project_id: args.project_id, title: args.title, goal: args.goal, role: args.role,
       priority: args.priority, depends_on: args.depends_on, scope_in: args.scope_in, scope_out: args.scope_out,
-      acceptance_criteria: args.acceptance_criteria, permissions: args.permissions, status: TASK_STATUSES.DRAFT
+      acceptance_criteria: args.acceptance_criteria, planned_paths: args.planned_paths, semantic_keys: args.semantic_keys, base_ref: args.base_ref,
+      permissions: args.permissions, status: TASK_STATUSES.DRAFT
     });
     return jsonResult({ ok: true, task: publicTask(task) });
   });
@@ -92,8 +97,14 @@ export function registerTaskHubTools(mcp, { reg, store, jsonResult, authorizeAct
     if (task.status === TASK_STATUSES.RUNNING) throw new Error(`Task ${id} is RUNNING; use task_hub_submit_result with the active lease instead of a generic transition.`);
     if (!canTransition(task.status, to)) throw new Error(`Invalid task transition: ${task.status} -> ${to}.`);
     requiredGatePermissions(task, to);
+    let freshness = null;
+    if (to === TASK_STATUSES.MERGE_READY || task.status === TASK_STATUSES.MERGE_READY) {
+      if (typeof checkFreshness !== "function") throw new Error(`Task ${id} cannot prove merge freshness in this runtime.`);
+      freshness = await checkFreshness(task, { refreshBase: true, requireVerified: task.status === TASK_STATUSES.MERGE_READY });
+      if (!freshness?.fresh) throw new Error(`Task ${id} merge freshness check failed: ${freshness?.reason || "base/head freshness could not be proven"}.`);
+    }
     if (transitionNeedsApproval(task, to)) await authorizeAction(taskHubApprovalAction(task, to));
-    const updated = await store.transitionTask(id, to, { expectedVersion: expected_version, blockedReason: blocked_reason });
+    const updated = await store.transitionTask(id, to, { expectedVersion: expected_version, blockedReason: blocked_reason, freshness });
     return jsonResult({ ok: true, task: publicTask(updated) });
   });
 
@@ -101,7 +112,10 @@ export function registerTaskHubTools(mcp, { reg, store, jsonResult, authorizeAct
     title: "Claim ready Task Hub task", description: "Atomically claim one READY task for a worker lease. The raw lease id is returned only to the claimant and is never persisted.",
     inputSchema: { id: z.string().min(1).max(128), worker_id: z.string().min(1).max(200), lease_ms: z.number().int().min(1000).max(3600000).optional() }
   }, async ({ id, worker_id, lease_ms = 30_000 }) => {
-    const claimed = await store.claimTask(id, worker_id, lease_ms);
+    const task = await store.getTask(id);
+    if (!task) throw new Error(`Task ${id} not found.`);
+    const guardContext = typeof prepareClaimContext === "function" ? await prepareClaimContext(task) : null;
+    const claimed = await store.claimTask(id, worker_id, lease_ms, guardContext);
     return jsonResult({ lease_id: claimed.lease_id, task: publicTask(claimed.task) });
   });
 

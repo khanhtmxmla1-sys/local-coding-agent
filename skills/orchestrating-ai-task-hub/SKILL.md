@@ -62,7 +62,7 @@ Exceptions: `BLOCKED`, `FAILED`, `CANCELLED`.
 14. Commit, push, PR creation, merge, migration, deploy, and production writes remain approval-gated even when tasks run in parallel.
 15. Cleanup branches/worktrees only after the exact merged `main` SHA passes required smoke/E2E verification.
 
-Until runtime workspace-write locking and overlap detection are implemented, the Manager must enforce these rules before dispatching writable workers.
+Task Hub now enforces workspace-write locking and automatic overlap checks for guarded CODING claims. The Manager still owns task decomposition and must provide accurate project-relative planned paths, semantic keys, dependencies, and acceptance criteria; automatic detection is a guardrail, not a substitute for understanding task relationships.
 
 ## Required Companion Skills
 
