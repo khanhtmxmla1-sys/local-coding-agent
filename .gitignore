@@ -22,6 +22,7 @@ setup-wizard-report.txt
 
 mcp-inventory.local.json
 mcp-migration-output/
+.mcp-proxy-secrets.json
 
 # ---- Node ----
 node_modules/

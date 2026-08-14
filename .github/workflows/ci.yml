@@ -63,6 +63,8 @@ jobs:
           node --test ../scripts/network-doctor.test.mjs
           node --test ../scripts/mcp-migration-manager.test.mjs
           node --check ../scripts/mcp-migration-manager.mjs
+          node --check ../scripts/mcp-reverse-proxy.cjs
+          node --test ../scripts/mcp-reverse-proxy.test.mjs
           node --check ../scripts/validate-skills.mjs
           node --check ../scripts/support-report.mjs
           node ../scripts/local-coding-agent.mjs --help
