@@ -6,7 +6,7 @@ import { EventEmitter } from 'node:events';
 import { PassThrough } from 'node:stream';
 
 const require = createRequire(import.meta.url);
-const { createMcpProxy, redactLog, safeForwardHeaders, startChild, validateRouteProcess } = require('./mcp-reverse-proxy.cjs');
+const { createMcpProxy, redactLog, safeForwardHeaders, startChild, validateRouteProcess, resolveCommandSpec, buildRoutes } = require('./mcp-reverse-proxy.cjs');
 
 function listen(server) {
   return new Promise((resolve, reject) => {
@@ -276,4 +276,31 @@ test('child process launch is allowlisted and never uses a shell', () => {
     assert.deepEqual(calls[0].args, route.args);
   }
   assert.throws(() => validateRouteProcess({ command: 'cmd.exe', args: ['/c', 'whoami'] }), /not allowlisted/i);
+});
+test('Windows GitNexus launch resolves to a Node CLI entrypoint without shell execution', () => {
+  if (process.platform !== 'win32') return;
+  const previous = process.env.GITNEXUS_CLI_JS;
+  const fakeCli = `${process.cwd()}\\scripts\\mcp-reverse-proxy.test.mjs`;
+  process.env.GITNEXUS_CLI_JS = fakeCli;
+  try {
+    const spec = resolveCommandSpec('gitnexus', ['mcp']);
+    assert.equal(spec.file, process.execPath);
+    assert.equal(spec.args[0], fakeCli);
+    assert.deepEqual(spec.args.slice(1), ['mcp']);
+  } finally {
+    if (previous === undefined) delete process.env.GITNEXUS_CLI_JS;
+    else process.env.GITNEXUS_CLI_JS = previous;
+  }
+});
+
+test('Filesystem MCP route honors MCP_FILESYSTEM_ROOT instead of exposing the whole drive', () => {
+  const previous = process.env.MCP_FILESYSTEM_ROOT;
+  process.env.MCP_FILESYSTEM_ROOT = 'C:\\quizpro';
+  try {
+    const routes = buildRoutes({});
+    assert.equal(routes['/filesystem/sse'].args.at(-1), 'C:\\quizpro');
+  } finally {
+    if (previous === undefined) delete process.env.MCP_FILESYSTEM_ROOT;
+    else process.env.MCP_FILESYSTEM_ROOT = previous;
+  }
 });

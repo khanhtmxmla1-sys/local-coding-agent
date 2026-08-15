@@ -28,6 +28,12 @@ function resolveCommandSpec(command, args) {
     if (!fs.existsSync(npxCli)) throw new Error('npx-cli.js was not found; set NPX_CLI_JS');
     return { file: process.execPath, args: [npxCli, ...args] };
   }
+  if (process.platform === 'win32' && command === 'gitnexus') {
+    const appData = process.env.APPDATA || '';
+    const gitnexusCli = process.env.GITNEXUS_CLI_JS || path.join(appData, 'npm', 'node_modules', 'gitnexus', 'dist', 'cli', 'index.js');
+    if (!gitnexusCli || !fs.existsSync(gitnexusCli)) throw new Error('GitNexus CLI entrypoint was not found; set GITNEXUS_CLI_JS');
+    return { file: process.execPath, args: [gitnexusCli, ...args] };
+  }
   if (process.platform === 'win32' && command === 'zalo-agent' && process.env.ZALO_AGENT_EXECUTABLE) {
     return { file: process.env.ZALO_AGENT_EXECUTABLE, args };
   }
@@ -118,6 +124,7 @@ function safeForwardHeaders(headers) {
 
 function buildRoutes(secrets) {
   const cloudflareAccountId = valueFrom('CLOUDFLARE_ACCOUNT_ID', 'cloudflareAccountId', secrets);
+  const filesystemRoot = process.env.MCP_FILESYSTEM_ROOT || process.env.AGENT_WORKSPACE || ROOT_DIR;
   const figmaApiKey = valueFrom('FIGMA_API_KEY', 'figmaApiKey', secrets);
   const stitchApiKey = valueFrom('STITCH_API_KEY', 'stitchApiKey', secrets);
   const stitchProjectId = valueFrom('GOOGLE_CLOUD_PROJECT', 'stitchProjectId', secrets);
@@ -137,7 +144,7 @@ function buildRoutes(secrets) {
     '/memory/sse': route('memory', 'npx', ['-y', '@modelcontextprotocol/server-memory']),
     '/sentry/sse': route('sentry', 'npx', ['-y', '@sentry/mcp-server', `--access-token=${sentryAccessToken}`], { required: [['SENTRY_ACCESS_TOKEN', sentryAccessToken]] }),
     '/fetch/sse': route('fetch', 'npx', ['-y', 'mcp-server-fetch-typescript']),
-    '/filesystem/sse': route('filesystem', 'npx', ['-y', '@modelcontextprotocol/server-filesystem', 'C:\\']),
+    '/filesystem/sse': route('filesystem', 'npx', ['-y', '@modelcontextprotocol/server-filesystem', filesystemRoot]),
     '/puppeteer/sse': route('puppeteer', 'npx', ['-y', '@modelcontextprotocol/server-puppeteer']),
     '/context7/sse': route('context7', 'npx', ['-y', '@upstash/context7-mcp']),
     '/thinking/sse': route('thinking', 'npx', ['-y', '@modelcontextprotocol/server-sequential-thinking']),
