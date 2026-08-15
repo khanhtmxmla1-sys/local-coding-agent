@@ -34,10 +34,11 @@ jobs:
           node --check server.mjs
           node --check context-memory.mjs
           node --check context-memory.test.mjs
-          node --check task-hub/model.mjs
-          node --check task-hub/store.mjs
-          node --check task-hub/lease-proof.mjs
-          npm run test:task-hub
+          node --check task-hub-archive.mjs
+          node --check task-hub-archive.test.mjs
+          node --check task-hub-removal.test.mjs
+          node --check ../scripts/archive-task-hub-state.mjs
+          npm run test:task-hub-removal
           node --check test-agent.mjs
           node --check test-security.mjs
           node --check security-test.mjs

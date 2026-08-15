@@ -17,8 +17,8 @@ let pass = 0;
 let fail = 0;
 
 const toolNames = new Set(tools.tools.map((tool) => tool.name));
-const workerToolsOk = ["task_hub_project_register", "task_hub_project_get", "task_hub_project_list", "task_hub_dispatch", "task_hub_worker_status"].every((name) => toolNames.has(name));
-if (workerToolsOk) pass++; else fail++;
+const taskHubToolsAbsent = [...toolNames].every((name) => !name.startsWith("task_hub_"));
+if (taskHubToolsAbsent) pass++; else fail++;
 
 const localTaskTool = tools.tools.find((tool) => tool.name === "create_local_task");
 const localRoleEnum = localTaskTool?.inputSchema?.properties?.role?.enum || [];

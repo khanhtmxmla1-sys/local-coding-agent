@@ -16,7 +16,7 @@ import {
   AgentManager,
   ROLES,
   getRole,
-  isTaskHubManagedRole,
+
   generateAgentId,
   redactSecrets,
   truncateForChat,
@@ -25,7 +25,7 @@ import {
   workspaceAgentsDir,
   buildCodexExecArgs,
   buildCodexPrompt,
-  parseTaskHubCodexResult,
+
   codexSandboxForMode,
   isPidAlive,
   AGENT_ID_RE
@@ -72,15 +72,15 @@ test("truncateForChat caps long text and flags truncation", () => {
   assert.match(over.text, /truncated/);
 });
 
-test("getRole validates roles", () => {
+test("getRole validates public roles", () => {
   assert.equal(getRole("bug_fix").name, "bug_fix");
   assert.throws(() => getRole("nope_agent"), /Unknown role/);
-  assert.equal(Object.keys(ROLES).length, 8);
-  assert.equal(getRole("coding_worker").name, "coding_worker");
-  assert.equal(getRole("reviewer_worker").name, "reviewer_worker");
-  assert.equal(isTaskHubManagedRole("coding_worker"), true);
-  assert.equal(isTaskHubManagedRole("reviewer_worker"), true);
-  assert.equal(isTaskHubManagedRole("bug_fix"), false);
+  assert.equal(Object.keys(ROLES).length, 6);
+});
+
+test("Task Hub-only worker roles are not registered", () => {
+  assert.equal("coding_worker" in ROLES, false);
+  assert.equal("reviewer_worker" in ROLES, false);
 });
 
 test("makeLocalReportPath rejects bad ids", () => {
@@ -359,65 +359,6 @@ test("buildCodexExecArgs sets sandbox, cwd, non-interactive flags, stdin prompt"
   const oIdx = full.indexOf("--output-last-message");
   assert.ok(oIdx >= 0);
   assert.equal(full[oIdx + 1], "/tmp/last.txt");
-});
-
-test("Task Hub Codex workers use isolated non-escalating CLI settings", () => {
-  const args = buildCodexExecArgs({ role: "coding_worker", mode: "full", sandbox_mode: "workspace-write", workspace_root: process.cwd(), writable_roots: [] });
-  assert.ok(args.includes("--ephemeral"));
-  assert.ok(args.includes("--ignore-user-config"));
-  assert.ok(args.includes("--ignore-rules"));
-  const approvalIdx = args.indexOf("--ask-for-approval");
-  assert.ok(approvalIdx >= 0);
-  assert.equal(args[approvalIdx + 1], "never");
-  assert.ok(approvalIdx < args.indexOf("exec"));
-  const configIdx = args.indexOf("-c");
-  assert.ok(configIdx >= 0);
-  assert.equal(args[configIdx + 1], "sandbox_workspace_write.network_access=false");
-  const sandboxIdx = args.indexOf("--sandbox");
-  assert.ok(sandboxIdx >= 0);
-  assert.equal(args[sandboxIdx + 1], "workspace-write");
-  const windowsArgs = buildCodexExecArgs(
-    { role: "coding_worker", sandbox_mode: "workspace-write", workspace_root: process.cwd(), writable_roots: [] },
-    { platform: "win32" }
-  );
-  const windowsConfigIdx = windowsArgs.findIndex((value, index) => value === "-c" && windowsArgs[index + 1] === 'windows.sandbox="elevated"');
-  assert.ok(windowsConfigIdx > windowsArgs.indexOf("exec"));
-  assert.ok(windowsConfigIdx < windowsArgs.indexOf("--sandbox"));
-  const reviewerArgs = buildCodexExecArgs(
-    { role: "reviewer_worker", sandbox_mode: "read-only", workspace_root: process.cwd(), writable_roots: [] },
-    { platform: "win32" }
-  );
-  assert.equal(reviewerArgs.includes('windows.sandbox="elevated"'), false);
-  const linuxArgs = buildCodexExecArgs(
-    { role: "coding_worker", sandbox_mode: "workspace-write", workspace_root: process.cwd(), writable_roots: [] },
-    { platform: "linux" }
-  );
-  assert.equal(linuxArgs.includes('windows.sandbox="elevated"'), false);
-  const structured = buildCodexExecArgs(
-    { role: "coding_worker", sandbox_mode: "workspace-write", workspace_root: process.cwd(), writable_roots: [] },
-    { outputSchemaFile: "/tmp/task-hub-schema.json" }
-  );
-  const schemaIdx = structured.indexOf("--output-schema");
-  assert.ok(schemaIdx > structured.indexOf("exec"));
-  assert.equal(structured[schemaIdx + 1], "/tmp/task-hub-schema.json");
-});
-
-test("Task Hub Codex structured result fails closed on BLOCKED or malformed output", () => {
-  assert.deepEqual(parseTaskHubCodexResult('{"status":"DONE","summary":"verified","evidence":["tests pass"]}'), {
-    ok: true,
-    status: "DONE",
-    summary: "verified",
-    evidence: ["tests pass"]
-  });
-  assert.deepEqual(parseTaskHubCodexResult('{"status":"BLOCKED","summary":"sandbox denied write","evidence":["no file changed"]}'), {
-    ok: false,
-    status: "BLOCKED",
-    summary: "sandbox denied write",
-    evidence: ["no file changed"]
-  });
-  const malformed = parseTaskHubCodexResult("not-json");
-  assert.equal(malformed.ok, false);
-  assert.equal(malformed.status, "BLOCKED");
 });
 
 test("buildCodexExecArgs passes distinct writable roots through --add-dir", () => {

@@ -159,36 +159,8 @@ export const ROLES = {
       "Flag any public-tunnel exposure without MCP_AUTH_TOKEN."
     ],
     default_output: "security findings checklist"
-  },
-  coding_worker: {
-    name: "coding_worker",
-    description: "Implements one bounded Task Hub coding task inside one registered project workspace and verifies the result.",
-    allowed_task_type: "bounded code implementation and tests",
-    safety_notes: [
-      "Never commit, push, open a PR, merge, migrate, deploy, or write to production.",
-      "Stay inside the assigned project workspace and Task Hub scope.",
-      "Return concise verification evidence without secrets."
-    ],
-    default_output: "implementation evidence summary"
-  },
-  reviewer_worker: {
-    name: "reviewer_worker",
-    description: "Performs an independent read-only review of one Task Hub task with file/line evidence.",
-    allowed_task_type: "read-only code and verification review",
-    safety_notes: [
-      "Do not edit files or run mutating commands.",
-      "Report P1/P2/P3 findings with file:line evidence.",
-      "Never expose secrets in findings."
-    ],
-    default_output: "review findings"
   }
 };
-
-const TASK_HUB_MANAGED_ROLES = new Set(["coding_worker", "reviewer_worker"]);
-
-export function isTaskHubManagedRole(name) {
-  return TASK_HUB_MANAGED_ROLES.has(String(name));
-}
 
 export function getRole(name) {
   const role = ROLES[String(name)];
@@ -260,18 +232,6 @@ const ROLE_PLAYBOOK = {
     "2. Review command execution paths and mode/policy gates.",
     "3. Confirm the server binds loopback and is not on a public tunnel without auth.",
     "4. Verify approvals are one-time and workspace-scoped."
-  ],
-  coding_worker: () => [
-    "1. Inspect only the files needed for the bounded task.",
-    "2. Implement the smallest correct change inside the assigned workspace.",
-    "3. Run relevant tests/checks and inspect the diff.",
-    "4. Return concise evidence; do not perform Git delivery or deployment actions."
-  ],
-  reviewer_worker: () => [
-    "1. Inspect the task scope, diff, and verification evidence read-only.",
-    "2. Identify correctness, regression, and security issues by severity.",
-    "3. Cite file:line evidence for actionable findings.",
-    "4. Return a concise review; do not edit files."
   ]
 };
 
@@ -367,37 +327,6 @@ export function codexSandboxForMeta(meta = {}) {
   return codexSandboxForMode(meta.mode);
 }
 
-const TASK_HUB_CODEX_RESULT_SCHEMA = {
-  type: "object",
-  properties: {
-    status: { type: "string", enum: ["DONE", "BLOCKED"] },
-    summary: { type: "string" },
-    evidence: { type: "array", items: { type: "string" }, maxItems: 20 }
-  },
-  required: ["status", "summary", "evidence"],
-  additionalProperties: false
-};
-
-export function parseTaskHubCodexResult(raw) {
-  const fallback = {
-    ok: false,
-    status: "BLOCKED",
-    summary: "Task Hub Codex worker returned invalid structured output.",
-    evidence: []
-  };
-  try {
-    const parsed = JSON.parse(String(raw || "").trim());
-    if (!parsed || !["DONE", "BLOCKED"].includes(parsed.status) || typeof parsed.summary !== "string" || !Array.isArray(parsed.evidence)) return fallback;
-    if (parsed.evidence.some((item) => typeof item !== "string")) return fallback;
-    const summary = parsed.summary.replace(/\s+/g, " ").trim().slice(0, 1000);
-    if (!summary) return fallback;
-    const evidence = parsed.evidence.map((item) => item.replace(/\s+/g, " ").trim().slice(0, 1000)).filter(Boolean).slice(0, 20);
-    return { ok: parsed.status === "DONE", status: parsed.status, summary, evidence };
-  } catch {
-    return fallback;
-  }
-}
-
 /**
  * Pure builder for the `codex exec` argument vector (unit-tested). Does NOT
  * include the prompt itself: the prompt is fed on stdin (args end with "-").
@@ -406,23 +335,7 @@ export function parseTaskHubCodexResult(raw) {
 export function buildCodexExecArgs(meta, opts = {}) {
   const args = [];
   const sandbox = codexSandboxForMeta(meta);
-  const platform = String(opts.platform || process.platform);
-  if (isTaskHubManagedRole(meta.role)) {
-    args.push("--ask-for-approval", "never");
-  }
   args.push("exec");
-  if (isTaskHubManagedRole(meta.role)) {
-    args.push("--ephemeral", "--ignore-user-config", "--ignore-rules", "-c", "sandbox_workspace_write.network_access=false");
-    // --ignore-user-config intentionally drops the user's Codex settings. On
-    // native Windows that also removes the sandbox backend selection, and Codex
-    // then fails closed by downgrading workspace-write to read-only. Re-declare
-    // only the allowlisted backend needed by Task Hub coding workers; keep all
-    // other user config ignored and keep network/approval escalation disabled.
-    if (platform === "win32" && sandbox === "workspace-write") {
-      args.push("-c", 'windows.sandbox="elevated"');
-    }
-  }
-  if (opts.outputSchemaFile) args.push("--output-schema", opts.outputSchemaFile);
   args.push("--sandbox", sandbox);
   args.push("--skip-git-repo-check");
   args.push("--color", "never");
@@ -454,16 +367,10 @@ export function buildCodexPrompt(meta) {
         ...meta.permission_roots.map((root) => `- ${root.path} [${root.preset}; fs=${root.filesystem}; commands=${root.commands}]`)
       ]
     : [];
-  const outputInstructions = isTaskHubManagedRole(meta.role)
-    ? [
-        "The final response must match the provided JSON output schema.",
-        "Use status DONE only if the requested task and acceptance criteria were actually completed. Use BLOCKED if any required action could not be completed.",
-        "Keep summary and evidence concise and never include credentials or secret values."
-      ]
-    : [
-        "Keep your output concise. Do the task, then end your final message with a short",
-        "3-6 line summary of what you did or found."
-      ];
+  const outputInstructions = [
+    "Keep your output concise. Do the task, then end your final message with a short",
+    "3-6 line summary of what you did or found."
+  ];
   return [
     roleLine,
     ...outputInstructions,
@@ -547,10 +454,7 @@ const codexCli = {
 
     // Capture the final message to a temp file so we get a clean report.
     const outFile = path.join(os.tmpdir(), `codex-last-${meta.agent_id}.txt`);
-    const structuredTaskHubResult = isTaskHubManagedRole(meta.role);
-    const schemaFile = structuredTaskHubResult ? path.join(os.tmpdir(), `codex-schema-${meta.agent_id}.json`) : null;
-    if (schemaFile) await writeFile(schemaFile, JSON.stringify(TASK_HUB_CODEX_RESULT_SCHEMA), "utf8");
-    const args = buildCodexExecArgs(meta, { outputFile: outFile, outputSchemaFile: schemaFile });
+    const args = buildCodexExecArgs(meta, { outputFile: outFile });
     const prompt = buildCodexPrompt(meta);
 
     const startedAt = Date.now();
@@ -659,7 +563,6 @@ const codexCli = {
       /* no output-last-message file (e.g. codex errored early) */
     }
     await rm(outFile, { force: true }).catch(() => {});
-    if (schemaFile) await rm(schemaFile, { force: true }).catch(() => {});
 
     // If we resolved on the grace fallback, the child may still be alive: taskkill
     // may have returned non-zero (e.g. "Access is denied") or the child ignored
@@ -711,15 +614,6 @@ const codexCli = {
         log,
         error: `codex exited with code ${exit.code}`
       };
-    }
-
-    if (structuredTaskHubResult) {
-      const structured = parseTaskHubCodexResult(finalMessage.trim() || stdout.trim());
-      const report = [structured.summary, ...structured.evidence.map((item) => `- ${item}`)].join("\n");
-      if (!structured.ok) {
-        return { ok: false, summary: structured.summary, report, log, error: `codex reported ${structured.status.toLowerCase()}` };
-      }
-      return { ok: true, summary: structured.summary.slice(0, 300), report, log };
     }
 
     const report = finalMessage.trim() || stdout.trim() || "(codex produced no final message)";
