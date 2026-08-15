@@ -243,7 +243,7 @@ Add:
 "task-hub:quarantine": "node ../scripts/archive-task-hub-state.mjs quarantine"
 ```
 
-The archive/quarantine scripts are transitional operator tools. They remain after Task Hub removal so backups can be verified and restored.
+The archive/quarantine scripts are transitional operator tools. They remain after Task Hub removal so backups can be verified and restored. Quarantine fails closed unless the operator has stopped the runtime and passes `--runtime-stopped`.
 
 - [ ] **Step 7: Run GREEN for archive utility**
 
@@ -576,7 +576,7 @@ Record archive directory and manifest hash. If verification fails, stop; do not 
 
 - [ ] **Step 6: Quarantine and cut over**
 
-Gracefully stop only the verified live Local Coding Agent PID, run `npm run task-hub:quarantine`, start the candidate bundle on ports 8787/8790 with the same non-Task-Hub settings, and smoke-test health/tools/dashboard/GitHub/GitNexus/generic local tasks.
+Gracefully stop only the verified live Local Coding Agent PID, run `npm run task-hub:quarantine -- --runtime-stopped`, start the candidate bundle on ports 8787/8790 with the same non-Task-Hub settings, and smoke-test health/tools/dashboard/GitHub/GitNexus/generic local tasks.
 
 On failure: stop candidate, restore quarantine to original paths, restart previous runtime, and report rollback.
 

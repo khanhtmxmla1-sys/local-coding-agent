@@ -13,6 +13,8 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
+import { loadPermissionProfileSync } from "./permission-resolver.mjs";
+
 const moduleDir = path.dirname(fileURLToPath(import.meta.url));
 const DEFAULT_RUNTIME_VERSION = "5.0.0";
 const MANIFEST_NAME = "manifest.json";
@@ -53,7 +55,15 @@ export function resolveTaskHubStatePaths(env = process.env, platform = process.p
           )),
   );
   const defaultWorkspace = path.resolve(moduleDir, "..", "agent-workspace");
-  const workspaceRoot = path.resolve(env.AGENT_WORKSPACE || defaultWorkspace);
+  const legacyWorkspace = path.resolve(env.AGENT_WORKSPACE || defaultWorkspace);
+  const permissionProfile = loadPermissionProfileSync({
+    primaryRoot: legacyWorkspace,
+    mode: String(env.AGENT_MODE || "safe").toLowerCase() === "full" ? "full" : "safe",
+    profileJson: env.AGENT_PERMISSION_PROFILE_JSON || "",
+    profileFile: env.AGENT_PERMISSION_PROFILE_FILE || "",
+    profileName: env.AGENT_PERMISSION_PROFILE_NAME || "",
+  });
+  const workspaceRoot = path.resolve(permissionProfile.working_directory);
   const workspaceId = workspaceIdForRoot(workspaceRoot, platform);
 
   return {
@@ -232,7 +242,9 @@ export async function archiveTaskHubState(options) {
     workspaceId = "unknown",
     runtimeVersion = DEFAULT_RUNTIME_VERSION,
     now,
+    operations = {},
   } = options;
+  const copyDirectory = operations.copyDirectory || cp;
   if (!taskDir || !projectsDir || !backupRoot) {
     throw new Error("taskDir, projectsDir, and backupRoot are required.");
   }
@@ -265,7 +277,7 @@ export async function archiveTaskHubState(options) {
       hashes.set(relativePath, await sha256File(path.join(sourceDir, relativePath)));
     }
 
-    await cp(sourceDir, destinationDir, {
+    await copyDirectory(sourceDir, destinationDir, {
       recursive: true,
       errorOnExist: true,
       force: false,
@@ -273,6 +285,7 @@ export async function archiveTaskHubState(options) {
     });
     manifest.sources.push({ kind, original_path: path.resolve(sourceDir), status: "copied" });
 
+    const copiedEntries = [];
     for (const relativePath of sourceFiles) {
       const destinationFile = path.join(destinationDir, relativePath);
       const destinationInfo = await lstat(destinationFile);
@@ -282,13 +295,26 @@ export async function archiveTaskHubState(options) {
       if (destinationHash !== sourceHash) {
         throw new Error(`Archive verification failed for ${kind}/${relativePath}`);
       }
-      manifest.files.push({
+      const entry = {
         source: kind,
         relative_path: path.posix.join(kind, relativePath.replaceAll("\\", "/")),
+        source_relative_path: relativePath.replaceAll("\\", "/"),
         bytes: destinationInfo.size,
         sha256: destinationHash,
+      };
+      copiedEntries.push(entry);
+      manifest.files.push({
+        source: entry.source,
+        relative_path: entry.relative_path,
+        bytes: entry.bytes,
+        sha256: entry.sha256,
       });
     }
+    await verifyFileSnapshot(
+      destinationDir,
+      copiedEntries,
+      `Archive verification failed for ${kind}`,
+    );
   }
 
   manifest.files.sort((left, right) => left.relative_path.localeCompare(right.relative_path));
@@ -350,11 +376,18 @@ export async function quarantineTaskHubState(options) {
     projectsDir,
     archiveDir,
     quarantineRoot,
+    runtimeStopped = false,
     now,
+    operations = {},
   } = options;
   if (!taskDir || !projectsDir || !archiveDir || !quarantineRoot) {
     throw new Error("taskDir, projectsDir, archiveDir, and quarantineRoot are required.");
   }
+  if (runtimeStopped !== true) {
+    throw new Error("Quarantine requires explicit confirmation that the runtime is stopped.");
+  }
+  const movePath = operations.movePath || rename;
+  const writeJson = operations.writeJson || writeJsonAtomic;
 
   const { manifest } = await verifyTaskHubArchive({ archiveDir });
   const records = validatedManifestRecords(manifest);
@@ -394,34 +427,83 @@ export async function quarantineTaskHubState(options) {
   );
   await mkdir(quarantineDir);
   const moved = [];
-
-  try {
-    for (const [kind, sourceDir] of [["tasks", taskDir], ["projects", projectsDir]]) {
-      if (!activeSources.get(kind)) continue;
-      const destination = path.join(quarantineDir, kind);
-      await rename(sourceDir, destination);
-      moved.push({
+  const plannedMoves = SOURCE_KINDS
+    .filter((kind) => activeSources.get(kind))
+    .map((kind) => {
+      const sourceDir = kind === "tasks" ? taskDir : projectsDir;
+      return {
         kind,
         original_path: path.resolve(sourceDir),
-        quarantine_path: destination,
-      });
+        quarantine_path: path.join(quarantineDir, kind),
+        status: "planned",
+      };
+    });
+  const intentPath = path.join(quarantineDir, "quarantine-intent.json");
+  await writeJson(intentPath, {
+    version: 1,
+    kind: "local-coding-agent-task-hub-quarantine-intent",
+    created_at: currentDate(now).toISOString(),
+    archive_path: path.resolve(archiveDir),
+    status: "planned",
+    moves: plannedMoves,
+  });
+
+  try {
+    for (const entry of plannedMoves) {
+      await movePath(entry.original_path, entry.quarantine_path);
+      entry.status = "moved";
+      moved.push(entry);
+      await verifyFileSnapshot(
+        entry.quarantine_path,
+        records.files.get(entry.kind),
+        `Quarantined ${entry.kind} state changed since archive`,
+      );
     }
 
-    await writeJsonAtomic(path.join(quarantineDir, "quarantine-manifest.json"), {
+    await writeJson(path.join(quarantineDir, "quarantine-manifest.json"), {
       version: 1,
       kind: "local-coding-agent-task-hub-quarantine",
       created_at: currentDate(now).toISOString(),
       archive_path: path.resolve(archiveDir),
+      runtime_stopped_confirmed: true,
       moved,
     });
   } catch (error) {
+    const rollbackFailures = [];
     for (const entry of [...moved].reverse()) {
       try {
-        await rename(entry.quarantine_path, entry.original_path);
-      } catch {
-        // Preserve the original error; the quarantine directory records any
-        // move that could not be rolled back for operator recovery.
+        await movePath(entry.quarantine_path, entry.original_path);
+        entry.status = "rolled_back";
+      } catch (rollbackError) {
+        entry.status = "rollback_failed";
+        entry.rollback_error = rollbackError?.message || String(rollbackError);
+        rollbackFailures.push(rollbackError);
       }
+    }
+    if (rollbackFailures.length > 0) {
+      const recoveryPath = path.join(quarantineDir, "quarantine-recovery.json");
+      const recovery = {
+        version: 1,
+        kind: "local-coding-agent-task-hub-quarantine-recovery",
+        created_at: currentDate(now).toISOString(),
+        archive_path: path.resolve(archiveDir),
+        status: "rollback_failed",
+        original_error: error?.message || String(error),
+        rollback_errors: rollbackFailures.map((failure) => failure?.message || String(failure)),
+        moves: plannedMoves,
+      };
+      try {
+        await writeJson(recoveryPath, recovery);
+      } catch (journalError) {
+        throw new AggregateError(
+          [error, ...rollbackFailures, journalError],
+          "Quarantine failed, rollback failed, and the recovery record could not be written.",
+        );
+      }
+      throw new AggregateError(
+        [error, ...rollbackFailures],
+        `Quarantine failed and rollback failed. Recovery record: ${recoveryPath}`,
+      );
     }
     throw error;
   }

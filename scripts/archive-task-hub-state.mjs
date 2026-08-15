@@ -26,7 +26,7 @@ async function latestArchive(backupRoot) {
 
 const mode = process.argv[2];
 if (!["archive", "verify", "quarantine"].includes(mode)) {
-  throw new Error("Usage: archive-task-hub-state.mjs <archive|verify|quarantine> [--archive-dir PATH]");
+  throw new Error("Usage: archive-task-hub-state.mjs <archive|verify|quarantine> [--archive-dir PATH] [--runtime-stopped]");
 }
 
 const paths = resolveTaskHubStatePaths();
@@ -42,7 +42,11 @@ if (mode === "archive") {
   );
   result = mode === "verify"
     ? await verifyTaskHubArchive({ archiveDir })
-    : await quarantineTaskHubState({ ...paths, archiveDir });
+    : await quarantineTaskHubState({
+        ...paths,
+        archiveDir,
+        runtimeStopped: process.argv.includes("--runtime-stopped"),
+      });
 }
 
 process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);

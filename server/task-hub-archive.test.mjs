@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, readdir, rename, rm, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -9,6 +9,7 @@ import {
   quarantineTaskHubState,
   resolveTaskHubStatePaths,
   verifyTaskHubArchive,
+  workspaceIdForRoot,
 } from "./task-hub-archive.mjs";
 
 const fixedNow = () => new Date("2026-08-14T00:00:00.000Z");
@@ -44,6 +45,28 @@ test("resolveTaskHubStatePaths uses deterministic workspace-scoped defaults", ()
   assert.equal(resolved.backupRoot, path.join(resolved.privateStateDir, "backups", "task-hub"));
 });
 
+test("resolveTaskHubStatePaths uses the active permission profile working directory", () => {
+  const resolved = resolveTaskHubStatePaths(
+    {
+      LOCALAPPDATA: "C:\\State",
+      AGENT_WORKSPACE: "C:\\LegacyWorkspace",
+      AGENT_PERMISSION_PROFILE_JSON: JSON.stringify({
+        name: "active",
+        working_directory: "C:\\ProfileWorkspace",
+        roots: [{ path: "C:\\ProfileWorkspace", preset: "develop" }],
+      }),
+    },
+    "win32",
+  );
+
+  assert.equal(resolved.workspaceRoot, path.resolve("C:\\ProfileWorkspace"));
+  assert.equal(resolved.workspaceId, workspaceIdForRoot(resolved.workspaceRoot, "win32"));
+  assert.equal(
+    resolved.taskDir,
+    path.join(resolved.privateStateDir, "task-hub", resolved.workspaceId),
+  );
+});
+
 test("archive copies state and writes a verified sha256 manifest", async (t) => {
   const options = await fixture(t);
   const result = await archiveTaskHubState({
@@ -59,6 +82,28 @@ test("archive copies state and writes a verified sha256 manifest", async (t) => 
   assert.equal(result.manifest.files.length, 3);
   assert.deepEqual(JSON.parse(await readFile(result.manifestPath, "utf8")), result.manifest);
   assert.equal((await verifyTaskHubArchive({ archiveDir: result.archiveDir })).verified, true);
+});
+
+test("archive rejects a destination file created while the source is copied", async (t) => {
+  const options = await fixture(t);
+
+  await assert.rejects(
+    archiveTaskHubState({
+      ...options,
+      workspaceId: "0123456789abcdef",
+      now: fixedNow,
+      operations: {
+        copyDirectory: async (source, destination, copyOptions) => {
+          const { cp } = await import("node:fs/promises");
+          await cp(source, destination, copyOptions);
+          if (source === options.taskDir) {
+            await writeFile(path.join(destination, "late.json"), "{\"late\":true}\n");
+          }
+        },
+      },
+    }),
+    /file set|verification failed/i,
+  );
 });
 
 test("archive records absent sources without failing", async (t) => {
@@ -108,7 +153,7 @@ test("quarantine refuses to run without a verified manifest", async (t) => {
   );
 
   await assert.rejects(
-    quarantineTaskHubState({ ...options, archiveDir, now: fixedNow }),
+    quarantineTaskHubState({ ...options, archiveDir, runtimeStopped: true, now: fixedNow }),
     /verified archive/i,
   );
 });
@@ -124,6 +169,7 @@ test("verified archive quarantines active state without deleting the backup", as
   const result = await quarantineTaskHubState({
     ...options,
     archiveDir: archived.archiveDir,
+    runtimeStopped: true,
     now: () => new Date("2026-08-14T00:01:00.000Z"),
   });
 
@@ -137,6 +183,140 @@ test("verified archive quarantines active state without deleting the backup", as
     await readFile(path.join(result.quarantineDir, "quarantine-manifest.json"), "utf8"),
   );
   assert.equal(quarantineManifest.moved.length, 2);
+});
+
+test("quarantine requires an explicit stopped-runtime confirmation", async (t) => {
+  const options = await fixture(t);
+  const archived = await archiveTaskHubState({
+    ...options,
+    workspaceId: "0123456789abcdef",
+    now: fixedNow,
+  });
+
+  await assert.rejects(
+    quarantineTaskHubState({
+      ...options,
+      archiveDir: archived.archiveDir,
+      now: fixedNow,
+    }),
+    /runtime.*stopped/i,
+  );
+  assert.equal(
+    await readFile(path.join(options.taskDir, "task.json"), "utf8"),
+    "{\"id\":\"task-1\"}\n",
+  );
+});
+
+test("quarantine rolls back when state changes immediately before rename", async (t) => {
+  const options = await fixture(t);
+  const archived = await archiveTaskHubState({
+    ...options,
+    workspaceId: "0123456789abcdef",
+    now: fixedNow,
+  });
+  let mutated = false;
+
+  await assert.rejects(
+    quarantineTaskHubState({
+      ...options,
+      archiveDir: archived.archiveDir,
+      runtimeStopped: true,
+      now: fixedNow,
+      operations: {
+        movePath: async (source, destination) => {
+          if (!mutated && source === options.taskDir) {
+            mutated = true;
+            await writeFile(path.join(source, "late.json"), "{\"late\":true}\n");
+          }
+          await rename(source, destination);
+        },
+      },
+    }),
+    /changed since archive/i,
+  );
+  assert.equal(
+    await readFile(path.join(options.taskDir, "late.json"), "utf8"),
+    "{\"late\":true}\n",
+  );
+});
+
+test("quarantine rolls back all moves when the success manifest cannot be written", async (t) => {
+  const options = await fixture(t);
+  const archived = await archiveTaskHubState({
+    ...options,
+    workspaceId: "0123456789abcdef",
+    now: fixedNow,
+  });
+
+  await assert.rejects(
+    quarantineTaskHubState({
+      ...options,
+      archiveDir: archived.archiveDir,
+      runtimeStopped: true,
+      now: fixedNow,
+      operations: {
+        writeJson: async (target, value) => {
+          if (path.basename(target) === "quarantine-manifest.json") {
+            throw new Error("manifest write failed");
+          }
+          await writeFile(target, `${JSON.stringify(value, null, 2)}\n`);
+        },
+      },
+    }),
+    /manifest write failed/i,
+  );
+  assert.equal(
+    await readFile(path.join(options.taskDir, "task.json"), "utf8"),
+    "{\"id\":\"task-1\"}\n",
+  );
+  assert.equal(
+    await readFile(path.join(options.projectsDir, "projects.json"), "utf8"),
+    "{\"projects\":[]}\n",
+  );
+});
+
+test("quarantine journals and surfaces a failed rollback", async (t) => {
+  const options = await fixture(t);
+  const archived = await archiveTaskHubState({
+    ...options,
+    workspaceId: "0123456789abcdef",
+    now: fixedNow,
+  });
+  let taskMoved = false;
+
+  await assert.rejects(
+    quarantineTaskHubState({
+      ...options,
+      archiveDir: archived.archiveDir,
+      runtimeStopped: true,
+      now: fixedNow,
+      operations: {
+        movePath: async (source, destination) => {
+          if (source === options.taskDir) {
+            taskMoved = true;
+            await rename(source, destination);
+            return;
+          }
+          if (source === options.projectsDir) throw new Error("projects move failed");
+          if (taskMoved && destination === options.taskDir) throw new Error("task rollback failed");
+          await rename(source, destination);
+        },
+      },
+    }),
+    /rollback failed/i,
+  );
+
+  const quarantineEntries = await readdir(options.quarantineRoot, { withFileTypes: true });
+  const quarantineDir = path.join(
+    options.quarantineRoot,
+    quarantineEntries.find((entry) => entry.isDirectory()).name,
+  );
+  const journal = JSON.parse(
+    await readFile(path.join(quarantineDir, "quarantine-recovery.json"), "utf8"),
+  );
+  assert.equal(journal.status, "rollback_failed");
+  assert.match(journal.rollback_errors.join("\n"), /task rollback failed/i);
+  assert.equal(journal.moves.find((entry) => entry.kind === "tasks").status, "rollback_failed");
 });
 
 test("archive verification rejects a tampered copied file", async (t) => {
@@ -190,7 +370,12 @@ test("quarantine rejects active state that appeared after an absent archive", as
   await writeFile(path.join(options.taskDir, "late.json"), "{\"late\":true}\n");
 
   await assert.rejects(
-    quarantineTaskHubState({ ...options, archiveDir: archived.archiveDir, now: fixedNow }),
+    quarantineTaskHubState({
+      ...options,
+      archiveDir: archived.archiveDir,
+      runtimeStopped: true,
+      now: fixedNow,
+    }),
     /not backed up|changed since archive/i,
   );
   assert.equal(await readFile(path.join(options.taskDir, "late.json"), "utf8"), "{\"late\":true}\n");
@@ -206,7 +391,12 @@ test("quarantine rejects active state changed after archive", async (t) => {
   await writeFile(path.join(options.taskDir, "task.json"), "{\"id\":\"changed\"}\n");
 
   await assert.rejects(
-    quarantineTaskHubState({ ...options, archiveDir: archived.archiveDir, now: fixedNow }),
+    quarantineTaskHubState({
+      ...options,
+      archiveDir: archived.archiveDir,
+      runtimeStopped: true,
+      now: fixedNow,
+    }),
     /changed since archive/i,
   );
   assert.equal(await readFile(path.join(options.taskDir, "task.json"), "utf8"), "{\"id\":\"changed\"}\n");
