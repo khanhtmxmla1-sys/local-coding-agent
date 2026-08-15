@@ -457,6 +457,8 @@ if (DASHBOARD_PORT > 0) {
       if (url.pathname === "/api/clear-metrics" && req.method === "POST") return void dashApiClearMetrics(res);
       if (url.pathname === "/api/v5") return void dashApiV5(url, res);
       if (url.pathname === "/api/report" && req.method === "GET") return void dashApiReport(url, res);
+      if (url.pathname === "/api/agents" && req.method === "GET") return void dashApiAgents(url, res);
+      if (url.pathname === "/api/agent" && req.method === "GET") return void dashApiAgent(url, res);
       if (url.pathname === "/api/customer-prompts") return void dashApiCustomerPrompts(res);
       if (url.pathname === "/") {
         res.writeHead(302, { Location: "/ui" });
@@ -3417,6 +3419,73 @@ async function dashApiV5(url, res) {
         metrics: `http://${DASHBOARD_HOST}:${DASHBOARD_PORT}/metrics`,
         mcp_endpoint: `http://${HOST}:${PORT}/mcp`
       }
+    });
+  } catch (error) {
+    return sendJson(res, 500, { error: error?.message || "error" });
+  }
+}
+
+// Local-only generic sub-agent API used by Local Codex Studio.
+function dashApiAgents(url, res) {
+  try {
+    if (!agentManager) return sendJson(res, 200, { enabled: false, agents: [], roles: [] });
+    const status = url.searchParams.get("status") || undefined;
+    const limit = Math.min(Math.max(Number(url.searchParams.get("limit") || 100), 1), 200);
+    return sendJson(res, 200, {
+      enabled: true,
+      release_version: VERSION,
+      preview_version: PREVIEW_VERSION,
+      roles: Object.values(ROLES).map((role) => role.name),
+      providers: detectProviders(),
+      agents: agentManager.list({ status, limit })
+    });
+  } catch (error) {
+    return sendJson(res, 500, { error: error?.message || "error" });
+  }
+}
+
+// Serve one generic sub-agent's compact result or paginated artifact.
+async function dashApiAgent(url, res) {
+  try {
+    if (!agentManager) return sendJson(res, 404, { error: "preview_disabled" });
+    const id = url.searchParams.get("id") || "";
+    if (!AGENT_ID_RE.test(id)) return sendJson(res, 400, { error: "invalid agent id" });
+    const meta = agentManager.get(id);
+    if (!meta) return sendJson(res, 404, { error: "not_found" });
+
+    const source = url.searchParams.get("source");
+    if (source === "report" || source === "log") {
+      const offset = Math.max(0, Number(url.searchParams.get("offset") || 0));
+      const limit = Math.min(Math.max(Number(url.searchParams.get("limit") || 200), 1), 1000);
+      const view = await agentManager.readArtifact(id, source, { offset, limit });
+      return sendJson(res, 200, {
+        agent_id: meta.agent_id,
+        role: meta.role,
+        title: meta.title,
+        status: meta.status,
+        report_path: meta.report_path || null,
+        log_path: meta.log_path || null,
+        view
+      });
+    }
+
+    const maxChars = Math.min(Math.max(Number(url.searchParams.get("max_chars") || 8000), 200), 50000);
+    const result = await agentManager.result(id, maxChars);
+    return sendJson(res, 200, {
+      agent_id: meta.agent_id,
+      role: meta.role,
+      title: meta.title,
+      status: meta.status,
+      created_at: meta.created_at,
+      updated_at: meta.updated_at,
+      workspace_root: meta.workspace_root,
+      summary: meta.summary || "",
+      report_path: meta.report_path || null,
+      log_path: meta.log_path || null,
+      truncated: result.truncated,
+      total_chars: result.total_chars,
+      content: result.content,
+      error: meta.error || null
     });
   } catch (error) {
     return sendJson(res, 500, { error: error?.message || "error" });

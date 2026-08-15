@@ -52,7 +52,7 @@ function assertAbsent(source, forbidden, sourceName) {
   }
 }
 
-test("candidate server omits Task Hub while preserving core tools and dashboard views", async (t) => {
+test("candidate server omits Task Hub while preserving core tools and generic agent APIs", async (t) => {
   const root = await mkdtemp(join(os.tmpdir(), "task-hub-removal-"));
   const workspace = join(root, "workspace");
   const privateState = join(root, "private-state");
@@ -110,13 +110,21 @@ test("candidate server omits Task Hub while preserving core tools and dashboard 
 
   const dashboard = await (await fetch(`http://127.0.0.1:${dashboardPort}/`)).text();
   assert.equal(dashboard.includes('data-view="tasks"'), false);
-  assert.equal(dashboard.includes("/api/agents"), false);
   for (const label of ["Phê duyệt", "Tệp &amp; Diff", "/api/approvals", "/api/diff"]) {
     assert.ok(dashboard.includes(label), `dashboard surface missing: ${label}`);
   }
+
+  const agentsResponse = await fetch(`http://127.0.0.1:${dashboardPort}/api/agents`);
+  assert.equal(agentsResponse.status, 200);
+  const agents = await agentsResponse.json();
+  assert.equal(agents.enabled, true);
+  assert.ok(Array.isArray(agents.agents));
+  assert.equal(agents.roles.includes("coding_worker"), false);
+  assert.equal(agents.roles.includes("reviewer_worker"), false);
+
   assert.equal(
-    (await fetch(`http://127.0.0.1:${dashboardPort}/api/agents`)).status,
-    404,
+    (await fetch(`http://127.0.0.1:${dashboardPort}/api/agent?id=invalid`)).status,
+    400,
   );
 });
 
