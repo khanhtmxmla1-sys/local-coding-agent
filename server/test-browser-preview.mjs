@@ -138,7 +138,7 @@ try {
       dashboardUi.includes('data-view="overview"') &&
       dashboardUi.includes('data-view="activity"') &&
       dashboardUi.includes('data-view="approvals"') &&
-      dashboardUi.includes('data-view="tasks"') &&
+      !dashboardUi.includes('data-view="tasks"') &&
       dashboardUi.includes('data-view="reports"') &&
       dashboardUi.includes('data-view="files"') &&
       dashboardUi.includes('data-view="connections"')

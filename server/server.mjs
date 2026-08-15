@@ -26,7 +26,7 @@ import { fileURLToPath } from "node:url";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { z } from "zod";
-import { AgentManager, ROLES, detectProviders, isTaskHubManagedRole, AGENT_ID_RE } from "./agent-manager.mjs";
+import { AgentManager, ROLES, detectProviders, AGENT_ID_RE } from "./agent-manager.mjs";
 import { BrowserBridge, BROWSER_COMMAND_ID_RE, CHROME_EXTENSION_ORIGIN_RE } from "./browser-bridge.mjs";
 import {
   PermissionResolver,
@@ -46,12 +46,6 @@ import {
   cancelWindowsShutdown
 } from "./system-power.mjs";
 import { ContextMemory, contextPressure } from "./context-memory.mjs";
-import { TaskHubStore } from "./task-hub/store.mjs";
-import { registerTaskHubTools } from "./task-hub/tools.mjs";
-import { ProjectRegistry } from "./task-hub/project-registry.mjs";
-import { TaskHubDispatcher } from "./task-hub/worker-dispatcher.mjs";
-import { registerTaskHubWorkerTools } from "./task-hub/worker-tools.mjs";
-import { inspectGitRepository } from "./task-hub/repository-state.mjs";
 
 // ----------------------------------------------------------------------------
 // Configuration (all overridable via environment variables)
@@ -187,21 +181,6 @@ if (ROOTS.some((root) => isPathInside(canonicalizePath(APPROVALS_DIR), canonical
 }
 const APPROVAL_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const APPROVAL_TTL_MINUTES = boundedNumber(process.env.AGENT_APPROVAL_TTL_MINUTES, 10, 1, 30);
-
-// AI Task Hub authority-bearing orchestration state lives outside every
-// authorized workspace root so file-writing agents cannot forge task status,
-// permissions, or lease proofs by editing Task Hub JSON directly.
-const TASK_HUB_DIR = path.resolve(process.env.AGENT_TASK_HUB_DIR || path.join(PRIVATE_STATE_DIR, "task-hub", WORKSPACE_ID));
-if (ROOTS.some((root) => isPathInside(canonicalizePath(TASK_HUB_DIR), canonicalizePath(root)))) {
-  throw new Error("Task Hub storage must be outside every authorized workspace root. Set AGENT_TASK_HUB_DIR to a private operator-owned path.");
-}
-const TASK_HUB_STORE = new TaskHubStore({ dir: TASK_HUB_DIR, enforceParallelGuards: true });
-const TASK_HUB_PROJECTS_DIR = path.resolve(process.env.AGENT_TASK_HUB_PROJECTS_DIR || path.join(PRIVATE_STATE_DIR, "task-hub-projects"));
-if (ROOTS.some((root) => isPathInside(canonicalizePath(TASK_HUB_PROJECTS_DIR), canonicalizePath(root)))) {
-  throw new Error("Task Hub project registry must be outside every authorized workspace root. Set AGENT_TASK_HUB_PROJECTS_DIR to a private operator-owned path.");
-}
-const TASK_HUB_PROJECT_REGISTRY = new ProjectRegistry({ dir: TASK_HUB_PROJECTS_DIR });
-let TASK_HUB_DISPATCHER = null;
 
 // v2.6 Policy
 const AGENT_POLICY = (() => {
@@ -339,99 +318,6 @@ if (PREVIEW_ENABLED) {
     policy: AGENT_POLICY
   });
   await agentManager.init();
-  TASK_HUB_DISPATCHER = new TaskHubDispatcher({
-    store: TASK_HUB_STORE,
-    registry: TASK_HUB_PROJECT_REGISTRY,
-    agentManager,
-    resolveWorkspace: resolveTaskHubDispatchWorkspace,
-    prepareClaimContext: prepareTaskHubClaimContext,
-    providerAvailable: (name) => detectProviders().some((provider) => provider.name === name && provider.available),
-    maxRuntimeMs: boundedNumber(process.env.AGENT_TASK_HUB_WORKER_MAX_RUNTIME_MS, 300000, 1000, 600000),
-    leaseMs: boundedNumber(process.env.AGENT_TASK_HUB_WORKER_LEASE_MS, 360000, 2000, 3600000)
-  });
-}
-
-function resolveTaskHubRegistrationWorkspace(workspaceRoot) {
-  const decision = PERMISSION_RESOLVER.explain(workspaceRoot, "read");
-  if (!decision.allowed) {
-    throw new Error(`Project workspace is not readable in the active permission profile [${decision.reason}].`);
-  }
-  return { resolved: decision.resolved };
-}
-
-async function resolveTaskHubDispatchWorkspace(project, task) {
-  const capability = task.role === "CODING" ? "write" : "read";
-  const decision = PERMISSION_RESOLVER.explain(project.workspace_root, capability);
-  if (!decision.allowed) {
-    throw new Error(`Project ${project.id} workspace is not allowed for ${capability} [${decision.reason}].`);
-  }
-  const root = decision.root;
-  const hasDenyRules = Array.isArray(root?.deny) && root.deny.length > 0;
-  if (task.role === "CODING" && root?.filesystem !== "write") {
-    throw new Error(`Project ${project.id} cannot use the coding adapter because its permission root is not writable.`);
-  }
-  return {
-    resolved: decision.resolved,
-    can_write: task.role === "CODING",
-    has_deny_rules: hasDenyRules,
-    permission_profile: PERMISSION_RESOLVER.summary().name,
-    permission_roots: root ? [{ path: project.workspace_root, preset: root.preset, filesystem: root.filesystem, commands: root.commands }] : []
-  };
-}
-
-async function prepareTaskHubClaimContext(task, project = null, workspace = null) {
-  if (task?.role !== "CODING" || task?.permissions?.edit !== true) return null;
-  if (!task?.project_id) return null;
-  const resolvedProject = project || await TASK_HUB_PROJECT_REGISTRY.get(task.project_id);
-  if (!resolvedProject) throw new Error(`Project ${task.project_id} is not registered.`);
-  const resolvedWorkspace = workspace || await resolveTaskHubDispatchWorkspace(resolvedProject, task);
-  const state = await inspectGitRepository(resolvedWorkspace.resolved, { baseRef: task.base_ref || "origin/main", refreshBase: false });
-  return {
-    workspaceLockKey: state.workspace_lock_key,
-    repositoryKey: state.repository_key,
-    observedBaseSha: state.base_sha,
-    observedHeadSha: state.head_sha,
-    baseIsAncestor: state.base_is_ancestor,
-    isGitRepo: state.is_git_repo
-  };
-}
-
-async function checkTaskHubFreshness(task, { refreshBase = false, requireVerified = false } = {}) {
-  if (task?.role !== "CODING") return { fresh: false, reason: "merge freshness is supported only for CODING tasks", base_sha: null, head_sha: null, base_is_ancestor: null };
-  if (!task?.project_id) return { fresh: false, reason: "task has no project_id", base_sha: null, head_sha: null, base_is_ancestor: null };
-  const project = await TASK_HUB_PROJECT_REGISTRY.get(task.project_id);
-  if (!project) return { fresh: false, reason: `project ${task.project_id} is not registered`, base_sha: null, head_sha: null, base_is_ancestor: null };
-  const resolved = await resolveTaskHubDispatchWorkspace(project, task);
-  const state = await inspectGitRepository(resolved.resolved, { baseRef: task.base_ref || "origin/main", refreshBase });
-  const result = { ...state, fresh: false, reason: null };
-  if (!state.is_git_repo) {
-    result.reason = "project workspace is not a Git repository";
-    return result;
-  }
-  if (!state.base_sha || !state.head_sha) {
-    result.reason = `could not resolve ${state.base_ref} or HEAD`;
-    return result;
-  }
-  if (state.base_is_ancestor !== true) {
-    result.reason = `${state.base_ref} is not an ancestor of the task branch HEAD; sync/rebase is required`;
-    return result;
-  }
-  if (requireVerified) {
-    if (!task.verified_base_sha || !task.verified_head_sha) {
-      result.reason = "MERGE_READY has no verified base/head SHA evidence";
-      return result;
-    }
-    if (task.verified_base_sha !== state.base_sha) {
-      result.reason = `verified base SHA changed from ${task.verified_base_sha} to ${state.base_sha}`;
-      return result;
-    }
-    if (task.verified_head_sha !== state.head_sha) {
-      result.reason = `verified head SHA changed from ${task.verified_head_sha} to ${state.head_sha}`;
-      return result;
-    }
-  }
-  result.fresh = true;
-  return result;
 }
 
 let metrics = loadMetrics();
@@ -678,7 +564,6 @@ const SERVER_INSTRUCTIONS = [
   "Anti-lag workflow: do not paste full logs, full diffs, base64 blobs, image/icon inventories, or repeated single-file reads into chat. Save detailed output to local files or reports, then return a compact summary with paths and next actions.",
   "Prefer targeted line ranges, globs, read_many with max_chars, and run_command/run_commands with max_output_chars so long ChatGPT Web threads stay responsive.",
   "ChatGPT Web compact workflow: when the conversation grows long or feels slow, call context_status. If it recommends compacting, call compact_context with only established facts, decisions, constraints, completed work, open tasks, and the next action. Never include credentials or full source/log content. Then tell the user to open a NEW chat; in that fresh chat call resume_context FIRST and verify workspace_info/git_status before editing.",
-  "AI Task Hub orchestration: task_hub_create always starts DRAFT. Register each project once with task_hub_project_register, advance the task to READY, then use task_hub_dispatch for supported real workers. Task Hub uses the server's active policy-aware exact-action authorization: balanced requires exact local approval while full bypasses action approval only within already-authorized roots. CODING and REVIEWER use the registered project workspace; BROWSER fails closed until a browser-capable worker exists. Manual workers may still use claim/heartbeat/submit_result. Never copy lease credentials into notes, reports, or chat summaries.",
   "If a task matches an available skill, call list_skills first, then read_skill(name) to load its instructions before doing the work.",
   "Prefer a few large, well-targeted calls over many tiny ones.",
   ...(PREVIEW_ENABLED
@@ -709,22 +594,6 @@ function createMcpServer() {
   registerReviewTools(mcp);       // v2.4
   registerPlannerTools(mcp);      // v2.5
   registerPolicyTools(mcp);       // v2.6
-  registerTaskHubTools(mcp, {
-    reg,
-    store: TASK_HUB_STORE,
-    jsonResult,
-    authorizeAction: authorizeExactAction,
-    checkFreshness: checkTaskHubFreshness,
-    prepareClaimContext: prepareTaskHubClaimContext
-  });
-  registerTaskHubWorkerTools(mcp, {
-    reg,
-    jsonResult,
-    registry: TASK_HUB_PROJECT_REGISTRY,
-    dispatcher: TASK_HUB_DISPATCHER,
-    authorizeAction: authorizeExactAction,
-    resolveRegistrationWorkspace: resolveTaskHubRegistrationWorkspace
-  });
   registerProfileTools(mcp);      // v2.8
   if (PREVIEW_ENABLED) registerPermissionTools(mcp); // v5 official feature set
   if (PREVIEW_ENABLED) registerSystemPowerTools(mcp); // v5 official, separately opt-in
@@ -3556,7 +3425,7 @@ async function dashApiV5(url, res) {
   }
 }
 
-// v5.0.0-preview.2: local-only dashboard list of sub-agent tasks (metadata only).
+// Local-only generic sub-agent API used by Local Codex Studio.
 function dashApiAgents(url, res) {
   try {
     if (!agentManager) return sendJson(res, 200, { enabled: false, agents: [], roles: [] });
@@ -3566,7 +3435,7 @@ function dashApiAgents(url, res) {
       enabled: true,
       release_version: VERSION,
       preview_version: PREVIEW_VERSION,
-      roles: Object.values(ROLES).map((r) => r.name),
+      roles: Object.values(ROLES).map((role) => role.name),
       providers: detectProviders(),
       agents: agentManager.list({ status, limit })
     });
@@ -3575,7 +3444,7 @@ function dashApiAgents(url, res) {
   }
 }
 
-// Serve one sub-agent's compact result to the loopback dashboard (truncated).
+// Serve one generic sub-agent's compact result or paginated artifact.
 async function dashApiAgent(url, res) {
   try {
     if (!agentManager) return sendJson(res, 404, { error: "preview_disabled" });
@@ -3584,7 +3453,6 @@ async function dashApiAgent(url, res) {
     const meta = agentManager.get(id);
     if (!meta) return sendJson(res, 404, { error: "not_found" });
 
-    // v5.0.0-preview.3: paginated report/log viewer for the dashboard.
     const source = url.searchParams.get("source");
     if (source === "report" || source === "log") {
       const offset = Math.max(0, Number(url.searchParams.get("offset") || 0));
@@ -4207,7 +4075,7 @@ function dashboardHtml() {
       <button class="nav-item active" type="button" data-view="overview" onclick="setView('overview')"><span class="nav-icon">◉</span><span class="nav-text">Tổng quan</span></button>
       <button class="nav-item" type="button" data-view="activity" onclick="setView('activity')"><span class="nav-icon">↗</span><span class="nav-text">Hoạt động</span><span class="nav-count" id="errorNavCount"></span></button>
       <button class="nav-item" type="button" data-view="approvals" onclick="setView('approvals')"><span class="nav-icon">✓</span><span class="nav-text">Phê duyệt</span><span class="nav-count" id="approvalNavCount"></span></button>
-      <button class="nav-item preview-only" type="button" data-view="tasks" onclick="setView('tasks')"><span class="nav-icon">◎</span><span class="nav-text">Tác vụ</span><span class="nav-count" id="taskNavCount"></span></button>
+
       <button class="nav-item preview-only" type="button" data-view="reports" onclick="setView('reports')"><span class="nav-icon">▤</span><span class="nav-text">Báo cáo</span><span class="nav-count" id="reportNavCount"></span></button>
       <button class="nav-item" type="button" data-view="files" onclick="setView('files')"><span class="nav-icon">⌘</span><span class="nav-text">Tệp &amp; Diff</span></button>
       <button class="nav-item" type="button" data-view="connections" onclick="setView('connections')"><span class="nav-icon">⚙</span><span class="nav-text">Kết nối</span></button>
@@ -4295,21 +4163,6 @@ function dashboardHtml() {
         </div>
       </section>
 
-      <section class="view preview-only" data-view="tasks">
-        <div class="section-head"><div><h2>Tác vụ cục bộ <span class="pill ok">v5</span></h2><p class="section-copy">Theo dõi trạng thái, report và log của các local sub-agent.</p></div><span class="pill" id="v5agcount"></span></div>
-        <div class="panel">
-          <div id="v5agfilter" class="toolbar" style="margin-bottom:10px"></div>
-          <div class="table-wrap"><table id="v5agents"></table></div>
-          <div id="v5agviewer" style="display:none;margin-top:14px;border-top:1px solid var(--border);padding-top:14px">
-            <div class="section-head">
-              <div><strong id="v5agtitle"></strong><div class="note" id="v5agmeta"></div></div>
-              <div class="toolbar"><button class="btn" id="v5tabReport" type="button" onclick="agView('report')">Report</button><button class="btn" id="v5tabLog" type="button" onclick="agView('log')">Log</button><button class="btn" type="button" onclick="agPage(-1)">Trang trước</button><button class="btn" type="button" onclick="agPage(1)">200 dòng tiếp</button><button class="btn danger" type="button" onclick="agClose()">Đóng</button></div>
-            </div>
-            <pre class="ide-body" id="v5agentbody" style="max-height:520px;overflow:auto;border:1px solid var(--border);border-radius:10px"></pre>
-          </div>
-        </div>
-      </section>
-
       <section class="view preview-only" data-view="reports">
         <div class="section-head"><div><h2>Báo cáo cục bộ</h2><p class="section-copy">Log dài và kết quả phân tích được giữ trên máy, không đẩy vào hội thoại.</p></div><span class="pill" id="v5repcount"></span></div>
         <div class="panel">
@@ -4394,7 +4247,7 @@ var viewCopy={
   overview:['Tổng quan hệ thống','Tình trạng phiên làm việc, hiệu năng và các mục cần chú ý.'],
   activity:['Hoạt động','Hiệu năng, lỗi và lịch sử gọi tool trong phiên hiện tại.'],
   approvals:['Trung tâm phê duyệt','Duyệt đúng hành động và đường dẫn đang yêu cầu quyền.'],
-  tasks:['Tác vụ cục bộ','Theo dõi các local sub-agent và xem report hoặc log.'],
+
   reports:['Báo cáo cục bộ','Dữ liệu dài được giữ trên máy để hội thoại luôn gọn.'],
   files:['Tệp & Diff','Duyệt source read-only và kiểm tra thay đổi Git.'],
   connections:['Workspace & Kết nối','Authorized paths, endpoint, preview và Chrome Companion.']
@@ -4414,7 +4267,7 @@ function setView(name,skipHash){
   document.getElementById('viewDescription').textContent=viewCopy[name][1];
   if(!skipHash && history.replaceState) history.replaceState(null,'','#'+name);
   if(name==='files'&&!treeLoaded) loadTree();
-  if(name==='tasks') loadAgents();
+
   if(name==='reports'||name==='connections'||name==='activity') loadV5();
   window.scrollTo({top:0,behavior:'smooth'});
 }
@@ -4427,7 +4280,7 @@ function manualRefresh(){
   tick();
   loadV5();
   loadApprovals();
-  if(activeView==='tasks') loadAgents();
+
   if(activeView==='files') refreshFilesView();
 }
 window.addEventListener('hashchange',initialView);
@@ -4708,77 +4561,13 @@ function v5Page(dir){
   if(n<0) n=0; if(n>=v5Total&&dir>0) return;
   v5Off=n; loadV5();
 }
-function agBadge(s){
-  var c={queued:'#64748b',running:'#0ea5e9',done:'#22c55e',failed:'#ef4444',cancelled:'#a855f7'}[s]||'#64748b';
-  return '<span style="background:'+c+';color:#04121a;padding:1px 7px;border-radius:9px;font-size:11px;font-weight:700">'+esc(s)+'</span>';
-}
-var agAll=[], agFilter='all', agCur=null;
-function agTime(s){ return fmtTime(s); }
-function renderAgFilter(){
-  var counts={all:agAll.length,queued:0,running:0,done:0,failed:0,cancelled:0};
-  agAll.forEach(function(a){ if(counts[a.status]!=null) counts[a.status]++; });
-  var html='';
-  ['all','running','queued','done','failed','cancelled'].forEach(function(k){
-    if(k!=='all'&&!counts[k]) return;
-    var on=(agFilter===k);
-    html+='<span class="btn agchip" data-k="'+k+'" style="'+(on?'background:#134e4a;border-color:#2dd4bf;color:#5eead4':'')+'">'+k+' '+counts[k]+'</span>';
-  });
-  document.getElementById('v5agfilter').innerHTML=html;
-}
-function agSetFilter(k){ agFilter=k; renderAgFilter(); renderAgTable(); }
-function renderAgTable(){
-  var rows=agAll.filter(function(a){ return agFilter==='all'||a.status===agFilter; });
-  var th='<tr><th style="text-align:left">agent</th><th style="text-align:left">role</th><th style="text-align:left">engine</th><th style="text-align:left">title</th><th>status</th><th>time</th></tr>';
-  rows.forEach(function(a){
-    th+='<tr><td><span class="btn agopen" data-id="'+esc(a.agent_id)+'">'+esc(a.agent_id.slice(0,10))+'</span></td>'+
-        '<td>'+esc(a.role)+'</td>'+
-        '<td class="dim">'+esc(a.provider||'script_runner')+'</td>'+
-        '<td class="dim">'+esc((a.title||'').slice(0,46))+'</td>'+
-        '<td style="text-align:center">'+agBadge(a.status)+'</td>'+
-        '<td class="dim" style="text-align:center">'+agTime(a.created_at)+'</td></tr>';
-  });
-  document.getElementById('v5agents').innerHTML=rows.length?th:'<tr><td class="dim">No local tasks'+(agFilter!=='all'?(' with status '+agFilter):'')+'. Ask ChatGPT to call create_local_task, or use the CLI (agents spawn).</td></tr>';
-}
-async function loadAgents(){
-  try{
-    var r=await fetch('/api/agents?limit=200',{cache:'no-store'}); var d=await r.json();
-    if(!d.enabled){ document.getElementById('v5agents').innerHTML='<tr><td class="dim">v5 features are disabled by compatibility mode.</td></tr>'; document.getElementById('v5agfilter').innerHTML=''; return; }
-    agAll=d.agents||[];
-    document.getElementById('v5agcount').textContent=String(agAll.length);
-    document.getElementById('taskNavCount').textContent=agAll.length?String(agAll.length):'';
-    renderAgFilter(); renderAgTable();
-  }catch(e){}
-}
-function agOpen(id){ agCur={id:id,source:'report',offset:0,view:null}; document.getElementById('v5agviewer').style.display='block'; agFetch(); }
-function agClose(){ agCur=null; document.getElementById('v5agviewer').style.display='none'; }
-function agView(src){ if(!agCur) return; agCur.source=src; agCur.offset=0; agFetch(); }
-function agPage(dir){ if(!agCur) return; if(dir>0 && agCur.view && !agCur.view.has_more) return; var n=agCur.offset+dir*200; if(n<0)n=0; agCur.offset=n; agFetch(); }
-async function agFetch(){
-  if(!agCur) return;
-  var body=document.getElementById('v5agentbody');
-  try{
-    var r=await fetch('/api/agent?id='+encodeURIComponent(agCur.id)+'&source='+agCur.source+'&offset='+agCur.offset+'&limit=200',{cache:'no-store'});
-    var d=await r.json();
-    if(d.error){ body.textContent='Error: '+d.error; return; }
-    document.getElementById('v5agtitle').textContent=(d.title||agCur.id)+'  ['+d.status+']';
-    document.getElementById('v5tabReport').style.opacity=(agCur.source==='report')?'1':'0.5';
-    document.getElementById('v5tabLog').style.opacity=(agCur.source==='log')?'1':'0.5';
-    var v=d.view||{}; agCur.view=v; agCur.offset=v.offset||0;
-    if(!v.exists){ body.textContent='(no '+agCur.source+' for this agent)'; document.getElementById('v5agmeta').textContent=''; return; }
-    body.textContent=v.content||'(empty)';
-    document.getElementById('v5agmeta').textContent='lines '+(v.offset+1)+'-'+(v.offset+v.returned_lines)+' of '+v.total_lines+(v.has_more?' (more below)':'');
-  }catch(e){ body.textContent='offline'; }
-}
-document.getElementById('v5agfilter').addEventListener('click',function(e){ var k=e.target.getAttribute('data-k'); if(k) agSetFilter(k); });
-document.getElementById('v5agents').addEventListener('click',function(e){ var id=e.target.getAttribute('data-id'); if(id) agOpen(id); });
 function refreshActiveView(){
   loadV5();
-  if(activeView==='tasks') loadAgents();
-  else if(activeView==='files') refreshFilesView();
+  if(activeView==='files') refreshFilesView();
 }
 initialView();
 loadV5();
-loadAgents();
+
 setInterval(refreshActiveView,5000);
 tick(); setInterval(tick,2500);
 </script>
@@ -6448,7 +6237,7 @@ const STRICT_MUTATION_TOOLS = new Set([
   "save_note", "compact_context", "checkpoint", "write_file", "replace_in_file", "apply_patch", "make_dir", "move_path", "delete_path",
   "run_command", "run_commands", "proc_start", "proc_stop", "git", "create_skill", "delete_skill", "undo_last_patch",
   "quality_gate", "run_tests", "run_build", "run_lint", "run_changed_tests", "task_plan", "task_state", "decision_log",
-  "task_hub_create", "task_hub_transition", "task_hub_claim", "task_hub_heartbeat", "task_hub_submit_result", "task_hub_project_register", "task_hub_dispatch",
+
   "browser_navigate", "browser_click", "browser_type", "browser_tab_action", "browser_press", "browser_select",
   "schedule_system_shutdown"
 ]);
@@ -7591,12 +7380,12 @@ function registerPreviewTools(mcp) {
   // ChatGPT Web does NOT run native sub-agents. It calls these tools; the server
   // runs and tracks sub-agent tasks locally and returns compact summaries.
   // --------------------------------------------------------------------------
-  const ROLE_NAMES = Object.keys(ROLES).filter((name) => !isTaskHubManagedRole(name));
-  const agentsHint = "Full output stays local; use get_local_task_result (compact) or the dashboard Local tasks panel.";
+  const ROLE_NAMES = Object.keys(ROLES);
+  const agentsHint = "Full output stays local; use get_local_task_result for a compact result.";
   const publicLocalTaskMeta = (taskId) => {
     const meta = agentManager.get(taskId);
     if (!meta) throw new Error(`No local task with id ${taskId}. Use list_local_tasks.`);
-    if (isTaskHubManagedRole(meta.role)) throw new Error(`Local task ${taskId} is managed by Task Hub. Use task_hub_worker_status instead.`);
+
     return meta;
   };
   // Neutral tool names + descriptions: these tools record a LOCAL task and run a
@@ -7685,7 +7474,7 @@ function registerPreviewTools(mcp) {
       }
     },
     async ({ status, limit = 20 }) => {
-      const agents = agentManager.list({ status, limit: 200 }).filter((meta) => !isTaskHubManagedRole(meta.role)).slice(0, limit);
+      const agents = agentManager.list({ status, limit });
       return jsonResult({ count: agents.length, dashboard_url: dashboardUrl, tasks: agents });
     }
   );

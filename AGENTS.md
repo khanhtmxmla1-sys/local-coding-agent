@@ -55,7 +55,7 @@ This runs `npm install` in `server/` and creates `tools/`. It does NOT need sudo
 - It is **not a sandbox**. For untrusted workspaces use a VM/container/WSL2.
 - Windows PowerShell 5.1 reads `.ps1` as ANSI — keep scripts ASCII-only.
 
-## ChatGPT / Task Hub operator workflow (mandatory)
+## ChatGPT operator workflow (mandatory)
 
 When a ChatGPT session is used to work on this repository, treat the following
 Vietnamese operator commands as approval gates with the exact meanings below.
@@ -69,11 +69,11 @@ Operator command:
 
 Required behavior:
 
-- Inspect the repository and relevant runtime state using Local Coding Agent / Task Hub.
+- Inspect the repository and relevant runtime state using Local Coding Agent.
 - Identify affected files, APIs, schemas, types, routes, shared components,
   migrations, permissions, generated contracts, and task dependencies.
-- Check active Task Hub work for workspace overlap, project-relative path overlap,
-  semantic overlap, explicit dependencies, and base SHA freshness.
+- Check the selected worktree, branch, scoped paths, semantic dependencies, and
+  base SHA freshness against other active work before implementation.
 - Produce a bounded implementation plan with acceptance criteria and expected
   verification.
 - Do not modify source files.
@@ -88,11 +88,10 @@ Operator command:
 Required behavior:
 
 - Create or use one isolated Git worktree and one dedicated branch for the task.
-- Create/use one Task Hub task/project mapping for that writable workspace.
-- Record project-relative `planned_paths`, relevant `semantic_keys`, explicit
-  `depends_on` relationships, acceptance criteria, and the current base SHA.
-- Let Workspace Write Lock, Automatic Overlap Detector, and Base SHA Freshness
-  checks fail closed before writable CODING proceeds.
+- Record the intended project-relative paths, semantic dependencies, acceptance
+  criteria, and current base SHA in the implementation plan.
+- Manually confirm the worktree is isolated, the scoped diff does not overlap
+  another writable task, and the recorded base is still current before editing.
 - Implement with relevant TDD/tests, then run independent review and security
   checks.
 - Stop before commit, push, or PR creation.
@@ -128,7 +127,7 @@ Operator command:
 Required behavior before merge:
 
 - Refresh the current base branch and verify the exact PR head SHA.
-- Enforce Base SHA Freshness Gate and recheck overlap/dependency evidence.
+- Recheck base SHA freshness and overlap/dependency evidence manually.
 - Require green CI and any required review/security gates.
 - If `main` advanced since verification, sync the feature branch with latest
   `main`, inspect textual and semantic conflicts, rerun tests/review/security,
@@ -150,27 +149,27 @@ share a repo; writable CODING must use isolated worktrees. Related integration
 is serialized: **CODING may run in parallel; integration / merge must be
 serialized.** Never treat an old green CI result as current after `main` changes.
 
-Automatic guards are safety controls, not substitutes for task understanding.
-The Manager must still provide accurate `planned_paths`, `semantic_keys`,
-`depends_on`, scope, and acceptance criteria.
+Manual isolation and freshness checks are safety controls, not substitutes for
+task understanding. The implementer must keep the intended paths, dependencies,
+scope, acceptance criteria, and base SHA explicit in the plan and review evidence.
 
 ## Parallel task delivery rules (mandatory)
 
-These rules apply whenever one project is being handled from multiple ChatGPT tabs,
-Task Hub tasks, or coding workers at the same time.
+These rules apply whenever one project is being handled from multiple ChatGPT tabs
+or coding workers at the same time.
 
 1. **Read-only work may run in parallel on the same repo.** Audits, planning, and
    reviewer tasks may share a source tree as long as they do not edit files.
 2. **Concurrent CODING work must be isolated.** Every writable task gets its own
-   Git worktree, branch, Task Hub task/project mapping, and later its own PR. Never
+   Git worktree, branch, bounded plan, and later its own PR. Never
    let two CODING workers write to the same working tree or writable root.
 3. **One task = one worktree = one branch = one PR.** Record the task's base SHA
    before coding and keep its scoped/planned touched paths as evidence.
-4. **Detect overlap before dispatch.** Compare active tasks for exact file/path
+4. **Detect overlap before editing.** Compare active tasks for exact file/path
    overlap and for semantic dependencies such as shared APIs, schemas, types,
    migrations, config, reusable components, or generated contracts. If one task
-   depends on another, encode `depends_on` or serialize them instead of pretending
-   they are independent.
+   depends on another, document it explicitly or serialize the work instead of
+   pretending they are independent.
 5. **Coding may be parallel; merge is serialized.** Only one related PR should be
    integrated into `main` at a time. After PR A merges, every related PR B that was
    verified against the old base must sync with the new `main` before it can merge.
@@ -191,9 +190,9 @@ Task Hub tasks, or coding workers at the same time.
     the exact `main` SHA and required smoke/E2E checks before deleting the feature
     branch/worktree.
 
-Task Hub enforces a durable workspace-write lock and automatic overlap check at CODING claim time. The
-Manager must still provide accurate project-relative `planned_paths`, `semantic_keys`, dependencies,
-and acceptance criteria so relationships that cannot be inferred mechanically remain visible.
+No service automatically locks worktrees or detects overlap. Before each writable
+session, verify the exact worktree/branch, compare scoped paths and semantic
+dependencies with other active work, and recheck base freshness before integration.
 
 ## Safety
 Read `SECURITY.md`. Prompt injection is real; only connect trusted workspaces.
